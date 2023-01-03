@@ -2,25 +2,25 @@ extern crate core;
 
 use std::collections::HashMap;
 
-use bitcoin::{
-    Address, Amount, EcdsaSighashType, KeyPair, Network, OutPoint, PackedLockTime, PublicKey,
-    schnorr, SchnorrSighashType, Script, secp256k1, Sequence, Transaction, TxIn, TxOut,
-    Witness, XOnlyPublicKey,
-};
 use bitcoin::blockdata::opcodes::all::{
     OP_CHECKSIGVERIFY, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256,
 };
 use bitcoin::blockdata::script;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::hex::ToHex;
-use bitcoin::psbt::Prevouts;
 use bitcoin::psbt::serialize::Serialize;
+use bitcoin::psbt::Prevouts;
 use bitcoin::secp256k1::{rand, Secp256k1, ThirtyTwoByteHash};
 use bitcoin::util::sighash::SighashCache;
 use bitcoin::util::taproot::TaprootBuilder;
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoin::{
+    schnorr, secp256k1, Address, Amount, EcdsaSighashType, KeyPair, Network, OutPoint,
+    PackedLockTime, PublicKey, SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut,
+    Txid, Witness, XOnlyPublicKey,
+};
 use bitcoincore_rpc::bitcoincore_rpc_json::{CreateRawTransactionInput, EstimateMode};
 use bitcoincore_rpc::json::SigHashType;
+use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 use nostr_sdk::Result;
 use rand::RngCore;
 use sha2::Digest;
@@ -70,6 +70,86 @@ fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
         .into_script()
 }
 
+struct Miner {
+    client: Client,
+}
+
+impl Miner {
+    fn new(rpc_client: Client) -> Self {
+        // unload any existing wallets, create miner wallet if it doesn't exist
+        for wallet in rpc_client.list_wallets().expect("Could not list wallets") {
+            rpc_client.unload_wallet(Some(&wallet));
+        }
+        if let Err(_) = rpc_client.load_wallet("miner") {
+            rpc_client.create_wallet("miner", None, None, None, None);
+        }
+
+        // make sure we have at least 100 bitcoin to use
+        let miner_address = rpc_client.get_new_address(None, None).unwrap();
+        while rpc_client.get_balance(Some(1), None).unwrap() < Amount::from_btc(100.0).unwrap() {
+            rpc_client.generate_to_address(1, &miner_address).unwrap();
+        }
+        Self { client: rpc_client }
+    }
+
+    fn get_new_address(&self) -> Address {
+        self.client.get_new_address(None, None).unwrap()
+    }
+
+    fn fund_address(&self, address: &Address, amount: Amount) -> Txid {
+        let miner_address = self.client.get_new_address(None, None).unwrap();
+        let utxo = self
+            .client
+            .list_unspent(Some(101), None, None, None, None)
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        let mut outputs = HashMap::new();
+        outputs.insert(address.to_string(), amount);
+        outputs.insert(
+            miner_address.to_string(),
+            utxo.amount - amount - Amount::from_sat(1000),
+        );
+        let raw_tx = self
+            .client
+            .create_raw_transaction(
+                &[CreateRawTransactionInput {
+                    txid: utxo.txid,
+                    vout: utxo.vout,
+                    sequence: None,
+                }],
+                &outputs,
+                None,
+                None,
+            )
+            .expect("Couldnt create raw tx");
+        let signed_tx = self
+            .client
+            .sign_raw_transaction_with_wallet(
+                &raw_tx,
+                None,
+                Some(SigHashType::from(EcdsaSighashType::All)),
+            )
+            .expect("Couldn't sign raw tx");
+        let txid = self.client.send_raw_transaction(&signed_tx.hex).unwrap();
+        self.gen_block();
+        txid
+    }
+
+    fn gen_block(&self) {
+        let miner_address = self.client.get_new_address(None, None).unwrap();
+        self.client.generate_to_address(1, &miner_address).unwrap();
+    }
+
+    fn send_raw_tx<T>(&self, tx: T) -> Txid
+    where
+        T: RawTx,
+    {
+        self.client.send_raw_transaction(tx).unwrap()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let secp = Secp256k1::new();
@@ -113,74 +193,10 @@ async fn main() -> Result<()> {
         Auth::UserPass("test".to_string(), "test".to_string()),
     )
     .expect("Couldn't make RPC client");
-    // unload any existing wallets
-    for wallet in rpc_client.list_wallets().expect("Could not list wallets") {
-        rpc_client.unload_wallet(Some(&wallet));
-    }
 
-    println!("creating miner wallet and generating some corn");
-    let miner_wallet_name = rpc_client
-        .create_wallet(&format!("miner-{}", exec_id), None, None, None, None)
-        .expect("Could not create miner wallet")
-        .name;
-    // mine some corn
-    let miner_address = rpc_client
-        .get_new_address(None, None)
-        .expect("Could not get address for miner");
-    rpc_client
-        .generate_to_address(105, &miner_address)
-        .expect("Could not generate blocks");
+    let miner = Miner::new(rpc_client);
 
-    // lets send some corn to that address
-    println!("sending some corn to the alice->bob escrow address");
-    let utxo = rpc_client
-        .list_unspent(Some(101), None, None, None, None)
-        .unwrap()
-        .first()
-        .unwrap()
-        .clone();
-    let mut alice_funding_output = HashMap::new();
-    alice_funding_output.insert(alice2bob_addr.to_string(), Amount::ONE_BTC);
-    alice_funding_output.insert(
-        miner_address.to_string(),
-        utxo.amount - Amount::ONE_BTC - Amount::from_sat(10000),
-    );
-    let raw_tx = rpc_client
-        .create_raw_transaction(
-            &[CreateRawTransactionInput {
-                txid: utxo.txid,
-                vout: utxo.vout,
-                sequence: None,
-            }],
-            &alice_funding_output,
-            None,
-            None,
-        )
-        .expect("Couldnt create raw tx");
-    let signed_tx = rpc_client
-        .sign_raw_transaction_with_wallet(
-            &raw_tx,
-            None,
-            Some(SigHashType::from(EcdsaSighashType::All)),
-        )
-        .expect("Couldn't sign raw tx");
-    let first_funding_txid = rpc_client
-        .send_raw_transaction(&signed_tx.hex)
-        .expect("Couldn't send raw tx");
-    println!("txid: {}", first_funding_txid.to_string());
-    println!("generating a block to confirm it");
-    rpc_client
-        .generate_to_address(1, &miner_address)
-        .expect("Could not generate blocks");
-
-    println!("lets make sure the outpoint from that tx is what we think it is...");
-    let signed_tx_hex = signed_tx.hex;
-    let signed_tx_decoded = Transaction::consensus_decode(&mut signed_tx_hex.as_slice()).unwrap();
-    assert_eq!(
-        signed_tx_decoded.output[0].script_pubkey,
-        alice2bob_addr.script_pubkey()
-    );
-    println!("looks good!");
+    let funding_txid = miner.fund_address(&alice2bob_addr, Amount::ONE_BTC);
 
     println!("Ok! Let's try to spend this sucker");
     println!("first up, lets do a key-path spend");
@@ -190,7 +206,7 @@ async fn main() -> Result<()> {
         lock_time: PackedLockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint {
-                txid: first_funding_txid,
+                txid: funding_txid,
                 vout: 0,
             },
             script_sig: script::Builder::new().into_script(), // this might be wrong
@@ -199,11 +215,16 @@ async fn main() -> Result<()> {
         }],
         output: vec![TxOut {
             value: Amount::from_btc(0.99).unwrap().to_sat(),
-            script_pubkey: miner_address.script_pubkey(),
+            script_pubkey: miner.get_new_address().script_pubkey(),
         }],
     };
 
-    let prevout = vec![&raw_tx.output[0]];
+    let funding_output = TxOut {
+        value: Amount::ONE_BTC.to_sat(),
+        script_pubkey: alice2bob_addr.script_pubkey(),
+    };
+
+    let prevout = vec![&funding_output];
 
     let mut sighash_cache = SighashCache::new(&keypath_tx);
     let sighash = sighash_cache
@@ -237,9 +258,7 @@ async fn main() -> Result<()> {
         &keypath_tx.serialize().to_hex()
     );
     println!("trying to send it.");
-    let keypath_txid = rpc_client
-        .send_raw_transaction(&keypath_tx.serialize())
-        .expect("couldnt send keypath tx");
+    let keypath_txid = miner.send_raw_tx(&keypath_tx.serialize());
 
     println!("Worked! {}", keypath_txid);
     Ok(())
