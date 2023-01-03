@@ -2,23 +2,30 @@ extern crate core;
 
 use std::collections::HashMap;
 
-use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
+use bitcoin::blockdata::opcodes::all::{
+    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256,
+};
 use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
+use bitcoin::locktime::Height;
 use bitcoin::psbt::serialize::Serialize;
 use bitcoin::psbt::Prevouts;
 use bitcoin::secp256k1::{rand, Secp256k1};
 use bitcoin::util::sighash::SighashCache;
 use bitcoin::util::taproot::{LeafVersion, TapLeafHash, TaprootBuilder};
-use bitcoin::{schnorr, secp256k1, Address, Amount, EcdsaSighashType, KeyPair, Network, OutPoint, PackedLockTime, SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey, LockTime};
-use bitcoin::locktime::Height;
+use bitcoin::{
+    schnorr, secp256k1, Address, Amount, EcdsaSighashType, KeyPair, LockTime, Network, OutPoint,
+    PackedLockTime, SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    XOnlyPublicKey,
+};
+use bitcoin::blockdata::opcodes::Ordinary::OP_EQUAL;
+use bitcoin::hashes::{Hash, sha256};
 use bitcoincore_rpc::bitcoincore_rpc_json::CreateRawTransactionInput;
 use bitcoincore_rpc::json::SigHashType;
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 use nostr_sdk::Result;
 use rand::RngCore;
-use sha2::Digest;
-use sha2::Sha256;
+
 
 struct Miner {
     client: Client,
@@ -158,25 +165,18 @@ async fn main() -> Result<()> {
     let bob = Participant::new();
 
     let alice_preimage = b"hello world";
-    let mut hasher = Sha256::new();
-    hasher.update(alice_preimage);
-    let alice_hashlock = hasher.finalize();
+    let alice_hashlock = sha256::Hash::hash(alice_preimage);
 
     let timelock_script = build_timelock_script(3, &alice.refund_keypair.x_only_public_key().0);
+    let hashlock_script = build_hashlock_script(
+        alice_hashlock.serialize().as_slice(),
+        &bob.hl_keypair.x_only_public_key().0,
+    );
 
     let taproot_spend_info = TaprootBuilder::new()
-        .add_leaf(
-            1u8,
-            build_hashlock_script(
-                alice_hashlock.as_slice(),
-                &bob.hl_keypair.x_only_public_key().0,
-            ),
-        )
+        .add_leaf(1u8, hashlock_script.clone())
         .expect("couldn't add hashlock leaf")
-        .add_leaf(
-            1u8,
-            timelock_script.clone(),
-        )
+        .add_leaf(1u8, timelock_script.clone())
         .expect("Couldn't add timelock leaf")
         .finalize(&secp, alice.escrow_keypair.x_only_public_key().0)
         .expect("Could not finalize taproot spend info");
@@ -264,10 +264,11 @@ async fn main() -> Result<()> {
     miner.gen_block();
     println!("Worked! {}", keypath_txid);
 
-
     println!("Now lets try doing a timelock spend");
     let funding_txid = miner.fund_address(&alice2bob_addr, Amount::ONE_BTC);
-    let control_block = taproot_spend_info.control_block(&(timelock_script.clone(), LeafVersion::TapScript)).unwrap();
+    let control_block = taproot_spend_info
+        .control_block(&(timelock_script.clone(), LeafVersion::TapScript))
+        .unwrap();
     let block_height = miner.get_block_height();
     let mut timelock_tx = Transaction {
         version: 2,
@@ -288,7 +289,6 @@ async fn main() -> Result<()> {
         }],
     };
 
-
     let funding_output = TxOut {
         value: Amount::ONE_BTC.to_sat(),
         script_pubkey: alice2bob_addr.script_pubkey(),
@@ -298,16 +298,29 @@ async fn main() -> Result<()> {
 
     let mut sighash_cache = SighashCache::new(&timelock_tx);
     let sighash = sighash_cache
-        .taproot_script_spend_signature_hash(0, &Prevouts::All(&prevout), TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript), SchnorrSighashType::Default).unwrap();
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&prevout),
+            TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript),
+            SchnorrSighashType::Default,
+        )
+        .unwrap();
     let message = secp256k1::Message::from(sighash);
     let signature = secp.sign_schnorr(&message, &alice.refund_keypair);
-    secp.verify_schnorr(&signature, &message, &alice.refund_keypair.x_only_public_key().0).expect("bad signature on timelock tx");
+    secp.verify_schnorr(
+        &signature,
+        &message,
+        &alice.refund_keypair.x_only_public_key().0,
+    )
+    .expect("bad signature on timelock tx");
     let final_sig = schnorr::SchnorrSig {
         sig: signature,
         hash_ty: SchnorrSighashType::Default,
     };
     timelock_tx.input[0].witness.push(final_sig.serialize());
-    timelock_tx.input[0].witness.push(timelock_script.serialize());
+    timelock_tx.input[0]
+        .witness
+        .push(timelock_script.serialize());
     timelock_tx.input[0].witness.push(control_block.serialize());
     println!(
         "here's the raw transaction: {}",
@@ -322,5 +335,70 @@ async fn main() -> Result<()> {
     let timelock_txid = miner.send_raw_tx(&timelock_tx.serialize());
     miner.gen_block();
     println!("Worked! {}", timelock_txid);
+
+    println!("For our last trick, we'll try a hashlock spend");
+    let funding_txid = miner.fund_address(&alice2bob_addr, Amount::ONE_BTC);
+    let control_block = taproot_spend_info
+        .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
+        .unwrap();
+
+    let mut hashlock_tx = Transaction {
+        version: 2,
+        lock_time: PackedLockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: funding_txid,
+                vout: 0,
+            },
+            script_sig: script::Builder::new().into_script(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_btc(0.99).unwrap().to_sat(),
+            script_pubkey: miner.get_new_address().script_pubkey(),
+        }],
+    };
+
+    let funding_output = TxOut {
+        value: Amount::ONE_BTC.to_sat(),
+        script_pubkey: alice2bob_addr.script_pubkey(),
+    };
+
+    let prevout = vec![&funding_output];
+
+    let mut sighash_cache = SighashCache::new(&hashlock_tx);
+    let sighash = sighash_cache
+        .taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&prevout),
+            TapLeafHash::from_script(&hashlock_script, LeafVersion::TapScript),
+            SchnorrSighashType::Default,
+        )
+        .unwrap();
+    let message = secp256k1::Message::from(sighash);
+    let signature = secp.sign_schnorr(&message, &bob.hl_keypair);
+    secp.verify_schnorr(&signature, &message, &bob.hl_keypair.x_only_public_key().0)
+        .expect("bad signature on hashlock tx");
+    let final_sig = schnorr::SchnorrSig {
+        sig: signature,
+        hash_ty: SchnorrSighashType::Default,
+    };
+    hashlock_tx.input[0].witness.push(final_sig.serialize());
+    hashlock_tx.input[0].witness.push(alice_preimage);
+    hashlock_tx.input[0]
+        .witness
+        .push(hashlock_script.serialize());
+    hashlock_tx.input[0].witness.push(control_block.serialize());
+    println!(
+        "here's the raw transaction: {}",
+        &hashlock_tx.serialize().to_hex()
+    );
+
+    println!("trying to send it.");
+    let hashlock_txid = miner.send_raw_tx(&hashlock_tx.serialize());
+    miner.gen_block();
+    println!("Worked! {}", hashlock_txid);
+
     Ok(())
 }

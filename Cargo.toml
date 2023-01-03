@@ -10,5 +10,4 @@ bitcoin = "0.29.2"
 bitcoincore-rpc = "0.16.0"
 nostr-sdk = "0.9.0"
 rand = "0.8.5"
-sha2 = "0.10.6"
 tokio = { version = "1", features = ["full"] }
