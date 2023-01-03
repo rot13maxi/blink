@@ -6,69 +6,24 @@ use bitcoin::blockdata::opcodes::all::{
     OP_CHECKSIGVERIFY, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256,
 };
 use bitcoin::blockdata::script;
-use bitcoin::consensus::Decodable;
 use bitcoin::hashes::hex::ToHex;
 use bitcoin::psbt::serialize::Serialize;
 use bitcoin::psbt::Prevouts;
-use bitcoin::secp256k1::{rand, Secp256k1, ThirtyTwoByteHash};
+use bitcoin::secp256k1::{rand, Secp256k1};
 use bitcoin::util::sighash::SighashCache;
 use bitcoin::util::taproot::TaprootBuilder;
 use bitcoin::{
     schnorr, secp256k1, Address, Amount, EcdsaSighashType, KeyPair, Network, OutPoint,
-    PackedLockTime, PublicKey, SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut,
-    Txid, Witness, XOnlyPublicKey,
+    PackedLockTime, SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    XOnlyPublicKey,
 };
-use bitcoincore_rpc::bitcoincore_rpc_json::{CreateRawTransactionInput, EstimateMode};
+use bitcoincore_rpc::bitcoincore_rpc_json::CreateRawTransactionInput;
 use bitcoincore_rpc::json::SigHashType;
 use bitcoincore_rpc::{Auth, Client, RawTx, RpcApi};
 use nostr_sdk::Result;
 use rand::RngCore;
 use sha2::Digest;
 use sha2::Sha256;
-
-struct Participant {
-    refund_keypair: KeyPair,
-    hl_keypair: KeyPair,
-    escrow_keypair: KeyPair,
-}
-
-impl Participant {
-    fn new() -> Self {
-        let secp = Secp256k1::new();
-        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
-        let refund_keypair = KeyPair::from_secret_key(&secp, &secret_key);
-
-        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
-        let hl_keypair = KeyPair::from_secret_key(&secp, &secret_key);
-
-        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
-        let escrow_keypair = KeyPair::from_secret_key(&secp, &secret_key);
-
-        Self {
-            refund_keypair,
-            hl_keypair,
-            escrow_keypair,
-        }
-    }
-}
-
-fn build_timelock_script(nblocks: i64, pubkey: &XOnlyPublicKey) -> Script {
-    script::Builder::new()
-        .push_int(nblocks)
-        .push_opcode(OP_CSV)
-        .push_opcode(OP_DROP)
-        .push_x_only_key(pubkey)
-        .push_opcode(OP_CHECKSIGVERIFY)
-        .into_script()
-}
-
-fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
-    script::Builder::new()
-        .push_opcode(OP_SHA256)
-        .push_slice(hash)
-        .push_opcode(OP_EQUALVERIFY)
-        .into_script()
-}
 
 struct Miner {
     client: Client,
@@ -148,6 +103,50 @@ impl Miner {
     {
         self.client.send_raw_transaction(tx).unwrap()
     }
+}
+
+struct Participant {
+    refund_keypair: KeyPair,
+    hl_keypair: KeyPair,
+    escrow_keypair: KeyPair,
+}
+
+impl Participant {
+    fn new() -> Self {
+        let secp = Secp256k1::new();
+        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let refund_keypair = KeyPair::from_secret_key(&secp, &secret_key);
+
+        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let hl_keypair = KeyPair::from_secret_key(&secp, &secret_key);
+
+        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
+        let escrow_keypair = KeyPair::from_secret_key(&secp, &secret_key);
+
+        Self {
+            refund_keypair,
+            hl_keypair,
+            escrow_keypair,
+        }
+    }
+}
+
+fn build_timelock_script(nblocks: i64, pubkey: &XOnlyPublicKey) -> Script {
+    script::Builder::new()
+        .push_int(nblocks)
+        .push_opcode(OP_CSV)
+        .push_opcode(OP_DROP)
+        .push_x_only_key(pubkey)
+        .push_opcode(OP_CHECKSIGVERIFY)
+        .into_script()
+}
+
+fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
+    script::Builder::new()
+        .push_opcode(OP_SHA256)
+        .push_slice(hash)
+        .push_opcode(OP_EQUALVERIFY)
+        .into_script()
 }
 
 #[tokio::main]
@@ -259,7 +258,7 @@ async fn main() -> Result<()> {
     );
     println!("trying to send it.");
     let keypath_txid = miner.send_raw_tx(&keypath_tx.serialize());
-
+    miner.gen_block();
     println!("Worked! {}", keypath_txid);
     Ok(())
 }
