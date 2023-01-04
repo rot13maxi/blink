@@ -5,6 +5,7 @@ use bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::{Parser, Subcommand};
 use nostr_sdk::nostr::event::TagKind::P;
+use crate::lib::contract::Contract;
 
 
 #[derive(Parser)]
@@ -115,7 +116,10 @@ fn main() -> anyhow::Result<()> {
         Commands::Blink(blink_command) => {
             match blink_command {
                 BlinkCommand::CreateOffer => {}
-                BlinkCommand::Propose { .. } => {}
+                BlinkCommand::Propose { .. } => {
+                    let mut contract = Contract::new_offer();
+                    contract.propose();
+                }
                 BlinkCommand::Accept { .. } => {}
                 BlinkCommand::Reveal { .. } => {}
                 BlinkCommand::Close { .. } => {}
