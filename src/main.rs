@@ -3,11 +3,10 @@ extern crate core;
 use std::collections::HashMap;
 
 use bitcoin::blockdata::opcodes::all::{
-    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256,
+    OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256,
 };
 use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
-use bitcoin::locktime::Height;
 use bitcoin::psbt::serialize::Serialize;
 use bitcoin::psbt::Prevouts;
 use bitcoin::secp256k1::{rand, Secp256k1};
@@ -18,7 +17,6 @@ use bitcoin::{
     PackedLockTime, SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
     XOnlyPublicKey,
 };
-use bitcoin::blockdata::opcodes::Ordinary::OP_EQUAL;
 use bitcoin::hashes::{Hash, sha256};
 use bitcoincore_rpc::bitcoincore_rpc_json::CreateRawTransactionInput;
 use bitcoincore_rpc::json::SigHashType;
@@ -401,4 +399,29 @@ async fn main() -> Result<()> {
     println!("Worked! {}", hashlock_txid);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::{Hash, sha256};
+    use bitcoin::secp256k1::{Message, Scalar, Secp256k1};
+
+    #[test]
+    fn test_that_we_can_smash_privkeys_together() {
+        let secp = Secp256k1::new();
+        let (seckey_a, pubkey_a) = secp.generate_keypair(&mut rand::thread_rng());
+        let (seckey_b, pubkey_b) = secp.generate_keypair(&mut rand::thread_rng());
+
+        // alice sends bob her pubkey
+
+        let shared_pubkey = pubkey_a.mul_tweak(&secp, &Scalar::from(seckey_b)).unwrap();
+        let bob2alice_pubkey = pubkey_b.mul_tweak(&secp, &Scalar::from(seckey_a)).unwrap();
+        assert_eq!(shared_pubkey, bob2alice_pubkey);
+        let shared_seckey = seckey_a.mul_tweak(&Scalar::from(seckey_b)).unwrap();
+
+        let h = sha256::Hash::hash(b"Hello, World");
+        let message = Message::from(h);
+        let sig = secp.sign_schnorr(&message, &shared_seckey.keypair(&secp));
+        secp.verify_schnorr(&sig, &message, &shared_pubkey.x_only_public_key().0).unwrap()
+    }
 }
