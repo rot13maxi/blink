@@ -35,9 +35,29 @@ enum Commands {
     Deposit,
     Balance,
     Withdraw,
-    Blink,
+    #[command(subcommand)]
+    Blink(BlinkCommand),
     Recover,
 }
+
+#[derive(Subcommand)]
+enum BlinkCommand {
+    CreateOffer,
+    Propose { id: String },
+    Accept {id: String},
+    Reveal {id: String},
+    Close {id: String},
+}
+
+/// Protocol is something like:
+/// Alice and Bob
+/// Alice -> Bob: Offer(id, PubKey, Hashlock, myTimelock, amount)
+/// Bob -> Alice: Propose(id, PubKey, myTimelock)
+/// Alice -> Bob: Accept(id)
+/// Bob -> Alice: Accept(id)
+/// Alice -> Bob: Reveal(id, preImage)
+/// Bob -> Alice: Close(id, secKey)
+/// Alice -> Bob: Close(id, secKey)
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -90,7 +110,15 @@ fn main() -> anyhow::Result<()> {
             println!("In the mempool: {}", total - confirmed);
         }
         Commands::Withdraw => { println!("Withdraw not implemented!") }
-        Commands::Blink => { println!("Blink not implemented!") }
+        Commands::Blink(blink_command) => {
+            match blink_command {
+                BlinkCommand::CreateOffer => {}
+                BlinkCommand::Propose { .. } => {}
+                BlinkCommand::Accept { .. } => {}
+                BlinkCommand::Reveal { .. } => {}
+                BlinkCommand::Close { .. } => {}
+            }
+        }
         Commands::Recover => { println!("Recover not implemented!") }
     }
 
