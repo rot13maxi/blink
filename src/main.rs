@@ -1,3 +1,5 @@
+mod lib;
+
 use anyhow::{anyhow, bail};
 use bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -51,8 +53,8 @@ enum BlinkCommand {
 
 /// Protocol is something like:
 /// Alice and Bob
-/// Alice -> Bob: Offer(id, PubKey, Hashlock, myTimelock, amount)
-/// Bob -> Alice: Propose(id, PubKey, myTimelock)
+/// Alice -> Bob: Offer(id, PubKeys, Hashlock, myTimelock, amount)
+/// Bob -> Alice: Propose(id, PubKeys, myTimelock)
 /// Alice -> Bob: Accept(id)
 /// Bob -> Alice: Accept(id)
 /// Alice -> Bob: Reveal(id, preImage)

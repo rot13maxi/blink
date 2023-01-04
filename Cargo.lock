@@ -142,6 +142,7 @@ dependencies = [
  "rand",
  "sled",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
