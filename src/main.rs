@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
             match blink_command {
                 BlinkCommand::CreateOffer => {}
                 BlinkCommand::Propose { .. } => {
-                    let mut contract = Contract::new_offer();
+                    let mut contract = Contract::new(cli.network);
                     contract.propose();
                 }
                 BlinkCommand::Accept { .. } => {}
