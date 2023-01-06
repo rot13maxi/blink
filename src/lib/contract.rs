@@ -1,3 +1,5 @@
+use std::fmt::{Display, Formatter, Write};
+use std::str::FromStr;
 use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
@@ -28,7 +30,7 @@ pub(crate) struct Proposal {
 }
 
 #[derive(Deserialize, serde::Serialize)]
-pub(crate) struct AcceptProposal {
+pub(crate) struct Offer {
     id: String,
     maker_pubkey: PublicKey,
     taker_pubkey: PublicKey,
@@ -36,12 +38,12 @@ pub(crate) struct AcceptProposal {
 }
 
 #[derive(Deserialize, serde::Serialize)]
-pub(crate) struct Accepted {
+pub(crate) struct FinalizeDeal {
     id: String,
 }
 
 #[derive(Deserialize, serde::Serialize, PartialEq, Debug)]
-enum ContractState {
+pub(crate) enum ContractState {
     Init,
     Offered,
     Proposed,
@@ -55,9 +57,32 @@ enum ContractState {
 }
 
 #[derive(Deserialize, serde::Serialize)]
-enum Role {
+pub(crate) enum Role {
     Maker,
     Taker,
+}
+
+impl FromStr for Role {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "maker" || s == "Maker" {
+            Ok(Role::Maker)
+        } else if s == "taker" || s == "Taker" {
+            Ok(Role::Taker)
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl Display for Role {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::Maker => f.write_str("Maker"),
+            Role::Taker => f.write_str("Taker")
+        }
+    }
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -73,9 +98,9 @@ struct Escrow {
 
 #[derive(Deserialize, serde::Serialize)]
 pub struct Contract {
-    id: String,
+    contract_id: String,
     network: Network,
-    state: ContractState,
+    pub(crate) state: ContractState,
     role: Role,
     maker_escrow: Escrow,
     taker_escrow: Escrow,
@@ -107,13 +132,17 @@ impl Contract {
         };
 
         Self {
-            id: Uuid::new_v4().to_string(),
+            contract_id: Uuid::new_v4().to_string(),
             network,
             state: Init,
             role: Role::Maker,
             maker_escrow,
             taker_escrow,
         }
+    }
+
+    pub fn id(&self) -> String {
+        format!("{}::{}", self.contract_id, self.role)
     }
 
     pub fn propose(&mut self) {
@@ -123,14 +152,17 @@ impl Contract {
         println!("{}", json!(proposal));
     }
 
-    pub(crate) fn accept_proposal(&mut self, accept_proposal: AcceptProposal) {
-        self.maker_escrow.their_pubkey = Some(accept_proposal.maker_pubkey);
-        self.taker_escrow.their_pubkey = Some(accept_proposal.taker_pubkey);
-        self.taker_escrow.timelock = Some(accept_proposal.taker_timelock);
+    pub(crate) fn accept_offer(&mut self, offer: Offer) {
+        self.maker_escrow.their_pubkey = Some(offer.maker_pubkey);
+        self.taker_escrow.their_pubkey = Some(offer.taker_pubkey);
+        self.taker_escrow.timelock = Some(offer.taker_timelock);
         self.state = ContractState::Accepted;
     }
 
-    pub(crate) fn accept(&mut self, accept: Accepted) {
+    pub(crate) fn finalize_deal(&mut self, finalized_deal: FinalizeDeal) {
+        // todo: make this return a Result so I'm not panicing
+        // todo: check that this is for the right ID
+        // assert_eq!(finalized_deal.id, self.id());
         self.state = ContractState::Accepted;
     }
 
@@ -237,7 +269,7 @@ impl Contract {
             .unwrap()
     }
 
-    fn get_address(&self, role: Role) -> Address {
+    pub(crate) fn get_address(&self, role: Role) -> Address {
         Address::p2tr_tweaked(
             self.build_taproot_spend_info(role).output_key(),
             self.network,
@@ -248,7 +280,7 @@ impl Contract {
 impl From<&mut Contract> for Proposal {
     fn from(value: &mut Contract) -> Proposal {
         Proposal {
-            id: value.id.clone(),
+            id: value.contract_id.clone(),
             network: value.network,
             maker_pubkey: value.maker_escrow.mine.public_key().clone(),
             taker_pubkey: value.taker_escrow.mine.public_key().clone(),
@@ -259,10 +291,10 @@ impl From<&mut Contract> for Proposal {
     }
 }
 
-impl From<&mut Contract> for AcceptProposal {
+impl From<&mut Contract> for Offer {
     fn from(value: &mut Contract) -> Self {
-        AcceptProposal {
-            id: value.id.clone(),
+        Offer {
+            id: value.contract_id.clone(),
             maker_pubkey: value.maker_escrow.mine.public_key().clone(),
             taker_pubkey: value.taker_escrow.mine.public_key().clone(),
             taker_timelock: value.taker_escrow.timelock.unwrap(),
@@ -270,10 +302,10 @@ impl From<&mut Contract> for AcceptProposal {
     }
 }
 
-impl From<&mut Contract> for Accepted {
+impl From<&mut Contract> for FinalizeDeal {
     fn from(value: &mut Contract) -> Self {
-        Accepted {
-            id: value.id.clone()
+        FinalizeDeal {
+            id: value.contract_id.clone()
         }
     }
 }
@@ -302,7 +334,7 @@ impl From<Proposal> for Contract {
         };
 
         Contract {
-            id: value.id,
+            contract_id: value.id,
             network: value.network,
             state: ContractState::Proposed,
             role: Role::Taker,
@@ -336,7 +368,7 @@ fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
 mod tests {
     use bitcoin::Network;
 
-    use crate::lib::contract::{Accepted, AcceptProposal, Contract, ContractState, Proposal, Role};
+    use crate::lib::contract::{FinalizeDeal, Offer, Contract, ContractState, Proposal, Role};
 
     #[test]
     fn test_contract_construction() {
@@ -349,12 +381,12 @@ mod tests {
         assert_eq!(maker.state, ContractState::Proposed);
         assert_eq!(taker.state, ContractState::Proposed);
 
-        let accept_proposal = AcceptProposal::from(&mut taker);
+        let offer = Offer::from(&mut taker);
         // send that over nostr
-        maker.accept_proposal(accept_proposal);
-        let accepted_msg = Accepted::from(&mut maker);
+        maker.accept_offer(offer);
+        let finalize_deal = FinalizeDeal::from(&mut maker);
         // send that over NOSTR
-        taker.accept(accepted_msg);
+        taker.finalize_deal(finalize_deal);
 
         // checks
         assert_eq!(maker.state, ContractState::Accepted);
@@ -371,7 +403,8 @@ mod tests {
         assert_eq!(maker.taker_escrow.timelock.unwrap(), taker.taker_escrow.timelock.unwrap());
         assert_eq!(maker_generated_maker_address, taker_generated_maker_address);
         assert_eq!(maker_generated_taker_address, taker_generated_taker_address);
-        // end checks
+        // end checks -- at this point we have both parties generating the same p2tr! woohoo!
+
 
 
     }

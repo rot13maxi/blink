@@ -1,16 +1,24 @@
 mod lib;
 
+use std::path::Path;
+use std::str::FromStr;
 use anyhow::{anyhow, bail};
+use bitcoin::hashes::hex::ToHex;
 use bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::bitcoincore_rpc_json::ImportDescriptors;
+use bitcoincore_rpc::json::Timestamp;
 use clap::{Parser, Subcommand};
 use nostr_sdk::nostr::event::TagKind::P;
-use crate::lib::contract::Contract;
+use crate::lib::contract::{Offer, Contract, Proposal, FinalizeDeal, Role};
 
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    #[arg(short, long, default_value_t = String::from("./blink_db"))]
+    db_path: String,
+
     #[arg(short, long, default_value_t = Network::Regtest)]
     network: Network,
 
@@ -45,9 +53,13 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum BlinkCommand {
-    CreateOffer,
+    CreateContract,
+    ListContracts,
     Propose { id: String },
-    Accept {id: String},
+    Offer { proposal_blob: String },
+    AcceptOffer {id: String, accept_offer_blob: String},
+    FinalizeDeal {id: String, finalize_deal_blob: String},
+    GetAddress {id: String, role: String},
     Reveal {id: String},
     Close {id: String},
 }
@@ -68,6 +80,8 @@ fn main() -> anyhow::Result<()> {
     if (cli.rpc_username.is_some() && cli.rpc_password.is_none()) || (cli.rpc_username.is_none() && cli.rpc_password.is_some()) {
         bail!("You need to provide an rpc user AND password, or neither")
     }
+
+    let tree = sled::open(cli.db_path)?;
 
     let rpc_client = Client::new(
         &format!("http://{}:{}", cli.rpc_host, cli.rpc_port),
@@ -95,7 +109,7 @@ fn main() -> anyhow::Result<()> {
     if need_to_load_or_create {
         if let Err(_) = rpc_client.load_wallet(&cli.wallet_name) {
             println!("Creating new wallet named {}", &cli.wallet_name);
-            rpc_client.create_wallet(&cli.wallet_name, None, None, None, None)?;
+            rpc_client.create_wallet(&cli.wallet_name, Some(true), None, None, None)?;
         }
         println!("Wallet loaded");
     }
@@ -115,12 +129,78 @@ fn main() -> anyhow::Result<()> {
         Commands::Withdraw => { println!("Withdraw not implemented!") }
         Commands::Blink(blink_command) => {
             match blink_command {
-                BlinkCommand::CreateOffer => {}
-                BlinkCommand::Propose { .. } => {
-                    let mut contract = Contract::new(cli.network);
-                    contract.propose();
+                BlinkCommand::CreateContract => {
+                    let contract = Contract::new(cli.network);
+                    tree.insert(contract.id(), serde_json::to_vec(&contract).unwrap().as_slice()).unwrap();
+                    println!("Created offer for contract ID {}", contract.id());
                 }
-                BlinkCommand::Accept { .. } => {}
+                BlinkCommand::ListContracts => {
+                    tree.iter().for_each(|item| {
+                        let (id_blob, contract_blob) = item.unwrap();
+                        let id = std::str::from_utf8(id_blob.as_ref()).unwrap();
+                        let contract: Contract = serde_json::from_slice(contract_blob.as_ref()).unwrap();
+                        println!("{} -- {:?}", id, contract.state);
+                    })
+                }
+                BlinkCommand::Propose { id } => {
+                    let mut contract: Contract = serde_json::from_slice(tree.get(id).unwrap().unwrap().as_ref()).unwrap();
+                    contract.propose();
+                    tree.insert(contract.id(), serde_json::to_vec(&contract).unwrap().as_slice()).unwrap();
+                }
+                BlinkCommand::Offer { proposal_blob } => {
+                    let proposal: Proposal = serde_json::from_str(&proposal_blob).unwrap();
+                    let mut taker_contract = Contract::from(proposal);
+                    let accept_proposal = Offer::from(&mut taker_contract);
+                    tree.insert(taker_contract.id(), serde_json::to_vec(&taker_contract).unwrap().as_slice()).unwrap();
+                    println!("{}", serde_json::to_string(&accept_proposal).unwrap());
+                }
+                BlinkCommand::AcceptOffer { id, accept_offer_blob } => {
+                    let mut contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();;
+                    let offer: Offer = serde_json::from_str(&accept_offer_blob).unwrap();
+                    contract.accept_offer(offer);
+                    let finalize_deal = FinalizeDeal::from(&mut contract);
+                    let address = contract.get_address(Role::Maker);
+                    let spk = address.script_pubkey();
+                    let gdi_result = rpc_client.get_descriptor_info(&format!("raw({})", spk.to_hex())).unwrap();
+                    println!("Importing into wallet");
+                    rpc_client.import_descriptors(ImportDescriptors {
+                        descriptor: format!("{}", gdi_result.descriptor),
+                        timestamp: Timestamp::Now,
+                        label: Some(id),
+                        active: None,
+                        internal: None,
+                        range: None,
+                        next_index: None
+                    }).unwrap();
+                    println!("Done importing into wallet");
+                    tree.insert(contract.id(), serde_json::to_vec(&contract).unwrap().as_slice()).unwrap();
+                    println!("{}", serde_json::to_string(&finalize_deal).unwrap());
+                }
+                BlinkCommand::FinalizeDeal {id, finalize_deal_blob } => {
+                    let mut taker_contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();;
+                    let finalize_deal: FinalizeDeal = serde_json::from_str(&finalize_deal_blob).unwrap();
+                    taker_contract.finalize_deal(finalize_deal);
+                    let address = taker_contract.get_address(Role::Taker);
+                    let spk = address.script_pubkey();
+                    let gdi_result = rpc_client.get_descriptor_info(&format!("raw({})", spk.to_hex())).unwrap();
+                    println!("Importing into wallet");
+                    rpc_client.import_descriptors(ImportDescriptors {
+                        descriptor: format!("{}", gdi_result.descriptor),
+                        timestamp: Timestamp::Now,
+                        label: Some(id),
+                        active: None,
+                        internal: None,
+                        range: None,
+                        next_index: None
+                    }).unwrap();
+                    println!("Done importing into wallet");
+                    tree.insert(taker_contract.id(), serde_json::to_vec(&taker_contract).unwrap().as_slice()).unwrap();
+                }
+                BlinkCommand::GetAddress {id, role} => {
+                    let contract: Contract = serde_json::from_slice(tree.get(id).unwrap().unwrap().as_ref()).unwrap();;
+                    let address = contract.get_address(Role::from_str(&role).unwrap());
+                    println!("{}", address.script_pubkey().to_hex());
+                }
                 BlinkCommand::Reveal { .. } => {}
                 BlinkCommand::Close { .. } => {}
             }
