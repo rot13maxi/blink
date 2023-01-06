@@ -1,17 +1,16 @@
-mod lib;
-
-use std::path::Path;
 use std::str::FromStr;
-use anyhow::{anyhow, bail};
-use bitcoin::hashes::hex::ToHex;
+
+use anyhow::{bail};
 use bitcoin::{Address, Network};
+use bitcoin::hashes::hex::ToHex;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use bitcoincore_rpc::bitcoincore_rpc_json::ImportDescriptors;
 use bitcoincore_rpc::json::Timestamp;
 use clap::{Parser, Subcommand};
-use nostr_sdk::nostr::event::TagKind::P;
-use crate::lib::contract::{Offer, Contract, Proposal, FinalizeDeal, Role};
 
+use crate::swap::contract::{Contract, FinalizeDeal, Offer, Proposal, Role};
+
+mod swap;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -178,7 +177,7 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string(&finalize_deal).unwrap());
                 }
                 BlinkCommand::FinalizeDeal {id, finalize_deal_blob } => {
-                    let mut taker_contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();;
+                    let mut taker_contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
                     let finalize_deal: FinalizeDeal = serde_json::from_str(&finalize_deal_blob).unwrap();
                     taker_contract.finalize_deal(finalize_deal);
                     let address = taker_contract.get_address(Role::Taker);
@@ -198,12 +197,12 @@ fn main() -> anyhow::Result<()> {
                     tree.insert(taker_contract.id(), serde_json::to_vec(&taker_contract).unwrap().as_slice()).unwrap();
                 }
                 BlinkCommand::GetAddress {id, role} => {
-                    let contract: Contract = serde_json::from_slice(tree.get(id).unwrap().unwrap().as_ref()).unwrap();;
+                    let contract: Contract = serde_json::from_slice(tree.get(id).unwrap().unwrap().as_ref()).unwrap();
                     let address = contract.get_address(Role::from_str(&role).unwrap());
                     println!("{}", address);
                 }
                 BlinkCommand::GetLocked { id} => {
-                    let contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();;
+                    let contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
                     let address = contract.get_address(contract.role.clone());
                     if escrow_confirmed(&rpc_client, 1, &address, 0)? {
                         println!("Ready to rock!");

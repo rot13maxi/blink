@@ -1,19 +1,19 @@
-use std::fmt::{Display, Formatter, Write};
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::psbt::serialize::Serialize;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::{Parity, Scalar, Secp256k1, SecretKey};
 use bitcoin::util::taproot::{TaprootBuilder, TaprootSpendInfo};
 use bitcoin::{Address, KeyPair, Network, Script, XOnlyPublicKey};
+use bitcoincore_rpc::json::ListUnspentResultEntry;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::lib::contract::ContractState::{Init, Proposed};
+use crate::swap::contract::ContractState::{Init, Proposed};
 
 const DEFAULT_TIMELOCK: u16 = 10;
 
@@ -95,6 +95,12 @@ struct Escrow {
     timelock: Option<u16>,
 }
 
+enum SpendPath {
+    Unspendable,
+    Timelock,
+    Hashlock,
+    Keypath,
+}
 
 #[derive(Deserialize, serde::Serialize)]
 pub struct Contract {
@@ -159,7 +165,7 @@ impl Contract {
         self.state = ContractState::Accepted;
     }
 
-    pub(crate) fn finalize_deal(&mut self, finalized_deal: FinalizeDeal) {
+    pub(crate) fn finalize_deal(&mut self, _finalized_deal: FinalizeDeal) {
         // todo: make this return a Result so I'm not panicing
         // todo: check that this is for the right ID
         // assert_eq!(finalized_deal.id, self.id());
@@ -186,8 +192,7 @@ impl Contract {
         }
     }
 
-    fn calculate_escrow_privkey(&self, role: Role) -> SecretKey {
-        let secp = Secp256k1::new();
+    fn _calculate_escrow_privkey(&self, role: Role) -> SecretKey {
         match role {
             Role::Maker => self
                 .maker_escrow
@@ -274,6 +279,29 @@ impl Contract {
             self.build_taproot_spend_info(role).output_key(),
             self.network,
         )
+    }
+
+    fn get_spend_path(&self, confirmations: u32) -> SpendPath {
+        if confirmations < 1 {
+            return SpendPath::Unspendable;
+        }
+        let escrow = match self.role {
+            Role::Maker => {&self.maker_escrow}
+            Role::Taker => {&self.taker_escrow}
+        };
+        if escrow.their_privkey.is_some() {
+            return SpendPath::Keypath;
+        }
+        if escrow.preimage.is_some() {
+            return SpendPath::Hashlock;
+        }
+        if let Some(timelock) = escrow.timelock {
+            if timelock <= confirmations as u16 {
+                return SpendPath::Timelock;
+            }
+        }
+
+        SpendPath::Unspendable
     }
 }
 
@@ -368,7 +396,7 @@ fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
 mod tests {
     use bitcoin::Network;
 
-    use crate::lib::contract::{FinalizeDeal, Offer, Contract, ContractState, Proposal, Role};
+    use crate::swap::contract::{FinalizeDeal, Offer, Contract, ContractState, Proposal, Role};
 
     #[test]
     fn test_contract_construction() {
