@@ -56,7 +56,7 @@ pub(crate) enum ContractState {
     Closed,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, serde::Serialize, Clone)]
 pub(crate) enum Role {
     Maker,
     Taker,
@@ -101,7 +101,7 @@ pub struct Contract {
     contract_id: String,
     network: Network,
     pub(crate) state: ContractState,
-    role: Role,
+    pub(crate) role: Role,
     maker_escrow: Escrow,
     taker_escrow: Escrow,
 }

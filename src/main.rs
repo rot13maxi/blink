@@ -4,7 +4,7 @@ use std::path::Path;
 use std::str::FromStr;
 use anyhow::{anyhow, bail};
 use bitcoin::hashes::hex::ToHex;
-use bitcoin::Network;
+use bitcoin::{Address, Network};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use bitcoincore_rpc::bitcoincore_rpc_json::ImportDescriptors;
 use bitcoincore_rpc::json::Timestamp;
@@ -60,6 +60,7 @@ enum BlinkCommand {
     AcceptOffer {id: String, accept_offer_blob: String},
     FinalizeDeal {id: String, finalize_deal_blob: String},
     GetAddress {id: String, role: String},
+    GetLocked {id: String},
     Reveal {id: String},
     Close {id: String},
 }
@@ -155,7 +156,7 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string(&accept_proposal).unwrap());
                 }
                 BlinkCommand::AcceptOffer { id, accept_offer_blob } => {
-                    let mut contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();;
+                    let mut contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
                     let offer: Offer = serde_json::from_str(&accept_offer_blob).unwrap();
                     contract.accept_offer(offer);
                     let finalize_deal = FinalizeDeal::from(&mut contract);
@@ -199,7 +200,20 @@ fn main() -> anyhow::Result<()> {
                 BlinkCommand::GetAddress {id, role} => {
                     let contract: Contract = serde_json::from_slice(tree.get(id).unwrap().unwrap().as_ref()).unwrap();;
                     let address = contract.get_address(Role::from_str(&role).unwrap());
-                    println!("{}", address.script_pubkey().to_hex());
+                    println!("{}", address);
+                }
+                BlinkCommand::GetLocked { id} => {
+                    let contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();;
+                    let address = contract.get_address(contract.role.clone());
+                    if escrow_confirmed(&rpc_client, 1, &address, 0)? {
+                        println!("Ready to rock!");
+                    } else {
+                        if escrow_confirmed(&rpc_client, 0, &address, 0)? {
+                            println!("In the mempool. waiting for confirmation");
+                        } else {
+                            println!("Nothing yet");
+                        }
+                    }
                 }
                 BlinkCommand::Reveal { .. } => {}
                 BlinkCommand::Close { .. } => {}
@@ -209,4 +223,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn escrow_confirmed(client: &Client, min_conf: usize, address: &Address, amount: u64) -> anyhow::Result<bool> {
+    let unspent = client.list_unspent(Some(min_conf), None, Some(&[address]), None, None)?;
+    let sum = unspent.iter().map(|utxo|utxo.amount.to_sat()).fold(0u64, |acc, x| acc + x);
+    if sum >= amount && sum != 0 {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
