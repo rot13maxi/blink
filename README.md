@@ -6,3 +6,6 @@
 - move wallet to BDK
 - Have some checking around current state and state transitions in contracts
 - wrap up state persistence into a top-level container type ("wallet"?)
+- handle multiple UTXOs associated with a contract
+- have my own utxo type the contract holds onto that the core-rpc client can convert into
+- put an index in the taptree so we can have different scriptpubkeys associated with the same contract for multi-tx swaps

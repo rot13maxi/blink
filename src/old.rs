@@ -265,7 +265,7 @@ fn old() -> Result<()> {
     let control_block = taproot_spend_info
         .control_block(&(timelock_script.clone(), LeafVersion::TapScript))
         .unwrap();
-    let block_height = miner.get_block_height();
+    // let block_height = miner.get_block_height();
     let mut timelock_tx = Transaction {
         version: 2,
         //lock_time: LockTime::Blocks(Height::from_consensus(2 + block_height as u32).unwrap()).into(),

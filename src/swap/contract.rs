@@ -1,16 +1,22 @@
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
 use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::psbt::serialize::Serialize;
+use bitcoin::psbt::Prevouts;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::{Parity, Scalar, Secp256k1, SecretKey};
-use bitcoin::util::taproot::{TaprootBuilder, TaprootSpendInfo};
-use bitcoin::{Address, KeyPair, Network, Script, XOnlyPublicKey};
+use bitcoin::util::sighash::SighashCache;
+use bitcoin::util::taproot::{LeafVersion, TapLeafHash, TaprootBuilder, TaprootSpendInfo};
+use bitcoin::{
+    schnorr, secp256k1, Address, KeyPair, Network, OutPoint, PackedLockTime,
+    SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
+};
 use bitcoincore_rpc::json::ListUnspentResultEntry;
 use serde::Deserialize;
 use serde_json::json;
+use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::swap::contract::ContractState::{Init, Proposed};
@@ -80,7 +86,7 @@ impl Display for Role {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Role::Maker => f.write_str("Maker"),
-            Role::Taker => f.write_str("Taker")
+            Role::Taker => f.write_str("Taker"),
         }
     }
 }
@@ -95,6 +101,7 @@ struct Escrow {
     timelock: Option<u16>,
 }
 
+#[derive(PartialEq)]
 enum SpendPath {
     Unspendable,
     Timelock,
@@ -285,9 +292,10 @@ impl Contract {
         if confirmations < 1 {
             return SpendPath::Unspendable;
         }
+        // TODO: We need to check the timelock on OUR escrow and the hashlock/keys on the OTHER escrow
         let escrow = match self.role {
-            Role::Maker => {&self.maker_escrow}
-            Role::Taker => {&self.taker_escrow}
+            Role::Maker => &self.taker_escrow,
+            Role::Taker => &self.maker_escrow,
         };
         if escrow.their_privkey.is_some() {
             return SpendPath::Keypath;
@@ -300,8 +308,141 @@ impl Contract {
                 return SpendPath::Timelock;
             }
         }
-
         SpendPath::Unspendable
+    }
+
+    /// Get a signed, ready-to-send TX that spends the contract
+    fn get_spending_tx(
+        &self,
+        utxo: &ListUnspentResultEntry,
+        address: Address,
+        fee_rate: Option<u64>,
+    ) -> Result<Transaction, ()> {
+        // TODO: we need to spend our escrow in a timelock spend and the other escrow otherwise
+        // wait. we should make sure that our escrow object is always the right one....
+        let escrow = match self.role {
+            Role::Maker => &self.taker_escrow,
+            Role::Taker => &self.maker_escrow,
+        };
+        let spend_path = self.get_spend_path(utxo.confirmations);
+        let prev_outpoint = OutPoint {
+            txid: utxo.txid,
+            vout: utxo.vout,
+        };
+        let prev_txout = TxOut {
+            value: utxo.amount.to_sat(),
+            script_pubkey: utxo.script_pub_key.clone(),
+        };
+        let vbytes = 600; // totally just made up number. todo: calculate this
+        let fee = vbytes * fee_rate.unwrap_or(1);
+        let mut tx = Transaction {
+            version: 2,
+            lock_time: PackedLockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev_outpoint,
+                sequence: if spend_path == SpendPath::Timelock {
+                    Sequence::from_height(escrow.timelock.unwrap())
+                } else {
+                    Sequence::MAX
+                },
+                script_sig: script::Builder::new().into_script(),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: utxo.amount.to_sat() - fee,
+                script_pubkey: address.script_pubkey(),
+            }],
+        };
+        let prevout = vec![prev_txout];
+        let secp = Secp256k1::new();
+        let mut sighash_cache = SighashCache::new(&tx);
+        // build and push tx witness based on what kind of tx we're doing
+        match spend_path {
+            SpendPath::Unspendable => return Err(()),
+            SpendPath::Timelock => {
+                let timelock_script = build_timelock_script(
+                    escrow.timelock.unwrap() as i64,
+                    &escrow.mine.x_only_public_key().0,
+                );
+                let control_block = self
+                    .build_taproot_spend_info(self.role.clone())
+                    .control_block(&(timelock_script.clone(), LeafVersion::TapScript))
+                    .unwrap();
+                let sighash = sighash_cache
+                    .taproot_script_spend_signature_hash(
+                        0,
+                        &Prevouts::All(&prevout),
+                        TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript),
+                        SchnorrSighashType::Default,
+                    )
+                    .unwrap();
+                let message = secp256k1::Message::from(sighash);
+                let signature = secp.sign_schnorr(&message, &escrow.mine);
+                let final_sig = schnorr::SchnorrSig {
+                    sig: signature,
+                    hash_ty: SchnorrSighashType::Default,
+                };
+                tx.input[0].witness.push(final_sig.serialize());
+                tx.input[0].witness.push(timelock_script.serialize());
+                tx.input[0].witness.push(control_block.serialize());
+            }
+            SpendPath::Hashlock => {
+                let hashlock_script = build_hashlock_script(
+                    escrow.hashlock.as_bytes(),
+                    &escrow.mine.x_only_public_key().0,
+                );
+                let control_block = self
+                    .build_taproot_spend_info(self.role.clone())
+                    .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
+                    .unwrap();
+                let sighash = sighash_cache
+                    .taproot_script_spend_signature_hash(
+                        0,
+                        &Prevouts::All(&prevout),
+                        TapLeafHash::from_script(&hashlock_script, LeafVersion::TapScript),
+                        SchnorrSighashType::Default,
+                    )
+                    .unwrap();
+                let message = secp256k1::Message::from(sighash);
+                let signature = secp.sign_schnorr(&message, &escrow.mine);
+                let final_sig = schnorr::SchnorrSig {
+                    sig: signature,
+                    hash_ty: SchnorrSighashType::Default,
+                };
+                tx.input[0].witness.push(final_sig.serialize());
+                tx.input[0].witness.push(escrow.preimage.clone().unwrap());
+                tx.input[0].witness.push(hashlock_script.serialize());
+                tx.input[0].witness.push(control_block.serialize());
+            }
+            SpendPath::Keypath => {
+                let sighash = sighash_cache
+                    .taproot_key_spend_signature_hash(
+                        0,
+                        &Prevouts::All(&prevout),
+                        SchnorrSighashType::Default,
+                    )
+                    .unwrap();
+                let message = secp256k1::Message::from(sighash);
+                let tweaked_keypair = escrow
+                    .mine
+                    .add_xonly_tweak(
+                        &secp,
+                        &self
+                            .build_taproot_spend_info(self.role.clone())
+                            .tap_tweak()
+                            .to_scalar(),
+                    )
+                    .unwrap();
+                let signature = secp.sign_schnorr(&message, &tweaked_keypair);
+                let final_sig = schnorr::SchnorrSig {
+                    sig: signature,
+                    hash_ty: SchnorrSighashType::Default,
+                };
+                tx.input[0].witness.push(final_sig.serialize());
+            }
+        };
+
+        Ok(tx)
     }
 }
 
@@ -333,7 +474,7 @@ impl From<&mut Contract> for Offer {
 impl From<&mut Contract> for FinalizeDeal {
     fn from(value: &mut Contract) -> Self {
         FinalizeDeal {
-            id: value.contract_id.clone()
+            id: value.contract_id.clone(),
         }
     }
 }
@@ -396,7 +537,7 @@ fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
 mod tests {
     use bitcoin::Network;
 
-    use crate::swap::contract::{FinalizeDeal, Offer, Contract, ContractState, Proposal, Role};
+    use crate::swap::contract::{Contract, ContractState, FinalizeDeal, Offer, Proposal, Role};
 
     #[test]
     fn test_contract_construction() {
@@ -423,17 +564,32 @@ mod tests {
         let maker_generated_taker_address = maker.get_address(Role::Taker);
         let taker_generated_maker_address = taker.get_address(Role::Maker);
         let taker_generated_taker_address = taker.get_address(Role::Taker);
-        assert_eq!(maker.maker_escrow.mine.public_key(), taker.maker_escrow.their_pubkey.unwrap());
-        assert_eq!(taker.maker_escrow.mine.public_key(), maker.maker_escrow.their_pubkey.unwrap());
-        assert_eq!(maker.calculate_escrow_pubkey(Role::Maker).0, taker.calculate_escrow_pubkey(Role::Maker).0);
-        assert_eq!(maker.calculate_escrow_pubkey(Role::Taker).0, taker.calculate_escrow_pubkey(Role::Taker).0);
-        assert_eq!(maker.maker_escrow.timelock.unwrap(), taker.maker_escrow.timelock.unwrap());
-        assert_eq!(maker.taker_escrow.timelock.unwrap(), taker.taker_escrow.timelock.unwrap());
+        assert_eq!(
+            maker.maker_escrow.mine.public_key(),
+            taker.maker_escrow.their_pubkey.unwrap()
+        );
+        assert_eq!(
+            taker.maker_escrow.mine.public_key(),
+            maker.maker_escrow.their_pubkey.unwrap()
+        );
+        assert_eq!(
+            maker.calculate_escrow_pubkey(Role::Maker).0,
+            taker.calculate_escrow_pubkey(Role::Maker).0
+        );
+        assert_eq!(
+            maker.calculate_escrow_pubkey(Role::Taker).0,
+            taker.calculate_escrow_pubkey(Role::Taker).0
+        );
+        assert_eq!(
+            maker.maker_escrow.timelock.unwrap(),
+            taker.maker_escrow.timelock.unwrap()
+        );
+        assert_eq!(
+            maker.taker_escrow.timelock.unwrap(),
+            taker.taker_escrow.timelock.unwrap()
+        );
         assert_eq!(maker_generated_maker_address, taker_generated_maker_address);
         assert_eq!(maker_generated_taker_address, taker_generated_taker_address);
         // end checks -- at this point we have both parties generating the same p2tr! woohoo!
-
-
-
     }
 }
