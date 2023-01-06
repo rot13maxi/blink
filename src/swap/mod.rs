@@ -1,2 +1,2 @@
 pub mod contract;
-mod utxo;
+pub mod utxo;

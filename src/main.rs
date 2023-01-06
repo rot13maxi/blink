@@ -3,12 +3,14 @@ use std::str::FromStr;
 use anyhow::{bail};
 use bitcoin::{Address, Network};
 use bitcoin::hashes::hex::ToHex;
+use bitcoin::psbt::serialize::Serialize;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use bitcoincore_rpc::bitcoincore_rpc_json::ImportDescriptors;
 use bitcoincore_rpc::json::Timestamp;
 use clap::{Parser, Subcommand};
 
-use crate::swap::contract::{Contract, FinalizeDeal, Offer, Proposal, Role};
+use crate::swap::contract::{Contract, FinalizeDeal, Offer, PreimageReveal, Proposal, Role};
+use crate::swap::utxo::Utxo;
 
 mod swap;
 
@@ -60,8 +62,12 @@ enum BlinkCommand {
     FinalizeDeal {id: String, finalize_deal_blob: String},
     GetAddress {id: String, role: String},
     GetLocked {id: String},
-    Reveal {id: String},
+    RevealPreimage {id: String},
+    AcceptPreimage {id: String, preimage_blob: String},
+    RevealKeys {id: String},
+    AcceptKeys {id: String, seckey_blob: String},
     Close {id: String},
+    Dump {id: String}
 }
 
 /// Protocol is something like:
@@ -214,8 +220,34 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                BlinkCommand::Reveal { .. } => {}
-                BlinkCommand::Close { .. } => {}
+                BlinkCommand::RevealPreimage { id } => {
+                    let mut contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
+                    println!("{}", serde_json::to_string(&contract.reveal_preimage().unwrap()).unwrap());
+                    tree.insert(contract.id(), serde_json::to_vec(&contract).unwrap().as_slice()).unwrap();
+
+                }
+                BlinkCommand::AcceptPreimage {id, preimage_blob} => {
+                    let mut contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
+                    let reveal: PreimageReveal = serde_json::from_str(&preimage_blob).unwrap();
+                    contract.accept_preimage(reveal);
+                    tree.insert(contract.id(), serde_json::to_vec(&contract).unwrap().as_slice()).unwrap();
+                }
+                BlinkCommand::RevealKeys {..} => {}
+                BlinkCommand::AcceptKeys {..} => {}
+                BlinkCommand::Close { id } => {
+                    let contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
+                    let address = contract.get_address(contract.role.clone());
+                    let unspent = rpc_client.list_unspent(Some(1), None, Some(&[&address]), None, None).unwrap();
+                    let utxo: Utxo = unspent[0].clone().into();
+                    let spend_tx = contract.get_spending_tx(&utxo, Address::from_str("bcrt1qvqqlv224wflslj2g3wkq6kxm5thvagcac56ktj").unwrap(), None).unwrap();
+                    println!("{}", spend_tx.serialize().to_hex());
+                }
+                
+                BlinkCommand::Dump { id } =>
+                    {
+                        let contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
+                        println!("{:?}", contract);
+                    }
             }
         }
         Commands::Recover => { println!("Recover not implemented!") }

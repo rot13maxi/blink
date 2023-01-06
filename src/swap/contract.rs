@@ -12,7 +12,6 @@ use bitcoin::{
     schnorr, secp256k1, Address, KeyPair, Network, OutPoint, PackedLockTime,
     SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
 };
-use bitcoincore_rpc::json::ListUnspentResultEntry;
 use serde::Deserialize;
 use serde_json::json;
 use std::fmt::{Display, Formatter};
@@ -77,10 +76,19 @@ pub(crate) enum ContractState {
     Closed,
 }
 
-#[derive(Deserialize, serde::Serialize, Clone, PartialEq)]
+#[derive(Deserialize, serde::Serialize, Clone, PartialEq, Debug)]
 pub(crate) enum Role {
     Maker,
     Taker,
+}
+
+impl Role {
+    fn other(&self) -> Role {
+        match self {
+            Role::Maker => Role::Taker,
+            Role::Taker => Role::Maker,
+        }
+    }
 }
 
 impl FromStr for Role {
@@ -106,7 +114,7 @@ impl Display for Role {
     }
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, serde::Serialize, Debug)]
 struct Escrow {
     mine: KeyPair,
     their_pubkey: Option<PublicKey>,
@@ -124,7 +132,7 @@ enum SpendPath {
     Keypath,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, serde::Serialize, Debug)]
 pub struct Contract {
     contract_id: String,
     network: Network,
@@ -194,8 +202,9 @@ impl Contract {
         self.state = ContractState::Accepted;
     }
 
-    pub(crate) fn reveal_preimage(&self) -> Result<PreimageReveal, ()> {
+    pub(crate) fn reveal_preimage(&mut self) -> Result<PreimageReveal, ()> {
         let preimage = self.maker_escrow.preimage.as_ref().ok_or(())?;
+        self.state = ContractState::HashRevealed;
         Ok(PreimageReveal {
             id: self.contract_id.clone(),
             preimage: preimage.to_string()
@@ -206,9 +215,11 @@ impl Contract {
         // todo: check that the ID is kosher
         self.maker_escrow.preimage = Some(preimage_reveal.preimage.clone());
         self.taker_escrow.preimage = Some(preimage_reveal.preimage.clone());
+        self.state = ContractState::HashRevealed;
     }
 
-    pub(crate) fn reveal_seckey(&self) -> Result<KeyReveal, ()> {
+    pub(crate) fn reveal_seckey(&mut self) -> Result<KeyReveal, ()> {
+        self.state = ContractState::KeyRevealed;
         Ok(KeyReveal {
             id: self.contract_id.clone(),
             maker_escrow_seckey: self.maker_escrow.mine.secret_key().clone(),
@@ -240,8 +251,8 @@ impl Contract {
         let secp = Secp256k1::new();
 
         let escrow = match role {
-            Role::Maker => &self.taker_escrow,
-            Role::Taker => &self.maker_escrow,
+            Role::Maker => &self.maker_escrow,
+            Role::Taker => &self.taker_escrow,
         };
 
         let timelock_blocks = escrow.timelock.unwrap();
@@ -278,6 +289,7 @@ impl Contract {
         if confirmations < REQUIRED_CONFIRMATIONS {
             return SpendPath::Unspendable;
         }
+        // their escrow for hashlock and keyspend paths, my escrow for timelock
         let escrow = match self.role {
             Role::Maker => &self.maker_escrow,
             Role::Taker => &self.taker_escrow,
@@ -288,6 +300,10 @@ impl Contract {
         if escrow.preimage.is_some() {
             return SpendPath::Hashlock;
         }
+        let escrow = match self.role {
+            Role::Maker => &self.taker_escrow,
+            Role::Taker => &self.maker_escrow,
+        };
         if let Some(timelock) = escrow.timelock {
             if timelock <= confirmations as u16 {
                 return SpendPath::Timelock;
@@ -297,17 +313,25 @@ impl Contract {
     }
 
     /// Get a signed, ready-to-send TX that spends the contract
-    fn get_spending_tx(
+    pub fn get_spending_tx(
         &self,
         utxo: &Utxo,
         address: Address,
         fee_rate: Option<u64>,
     ) -> Result<Transaction, ()> {
-        let escrow = match self.role {
-            Role::Maker => &self.taker_escrow,
-            Role::Taker => &self.maker_escrow,
-        };
         let spend_path = self.get_spend_path(utxo.confirmations);
+        // my escrow for timelock, their escrow otherwise
+        let escrow = if spend_path == SpendPath::Timelock {
+            match self.role {
+                Role::Maker => &self.maker_escrow,
+                Role::Taker => &self.taker_escrow,
+            }
+        } else {
+            match self.role {
+                Role::Maker => &self.taker_escrow,
+                Role::Taker => &self.maker_escrow,
+            }
+        };
         let prev_outpoint = OutPoint {
             txid: utxo.txid,
             vout: utxo.vout,
@@ -375,7 +399,7 @@ impl Contract {
                     &escrow.mine.x_only_public_key().0,
                 );
                 let control_block = self
-                    .build_taproot_spend_info(self.role.clone())
+                    .build_taproot_spend_info(self.role.other().clone())
                     .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
                     .unwrap();
                 let sighash = sighash_cache
