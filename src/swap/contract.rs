@@ -20,8 +20,10 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::swap::contract::ContractState::{Init, Proposed};
+use crate::swap::utxo::Utxo;
 
-const DEFAULT_TIMELOCK: u16 = 10;
+const DEFAULT_TIMELOCK: u16 = 144;
+const REQUIRED_CONFIRMATIONS: u32 = 1;
 
 #[derive(Deserialize, serde::Serialize)]
 pub(crate) struct Proposal {
@@ -48,6 +50,19 @@ pub(crate) struct FinalizeDeal {
     id: String,
 }
 
+#[derive(Deserialize, serde::Serialize)]
+pub(crate) struct PreimageReveal {
+    id: String,
+    preimage: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub(crate) struct KeyReveal {
+    id: String,
+    maker_escrow_seckey: SecretKey,
+    taker_escrow_seckey: SecretKey,
+}
+
 #[derive(Deserialize, serde::Serialize, PartialEq, Debug)]
 pub(crate) enum ContractState {
     Init,
@@ -62,7 +77,7 @@ pub(crate) enum ContractState {
     Closed,
 }
 
-#[derive(Deserialize, serde::Serialize, Clone)]
+#[derive(Deserialize, serde::Serialize, Clone, PartialEq)]
 pub(crate) enum Role {
     Maker,
     Taker,
@@ -101,7 +116,7 @@ struct Escrow {
     timelock: Option<u16>,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum SpendPath {
     Unspendable,
     Timelock,
@@ -179,93 +194,64 @@ impl Contract {
         self.state = ContractState::Accepted;
     }
 
-    fn calculate_escrow_pubkey(&self, role: Role) -> (XOnlyPublicKey, Parity) {
-        let secp = Secp256k1::new();
-        match role {
-            Role::Maker => self
-                .maker_escrow
-                .their_pubkey
-                .unwrap()
-                .mul_tweak(&secp, &Scalar::from(self.maker_escrow.mine.secret_key()))
-                .unwrap()
-                .x_only_public_key(),
-            Role::Taker => self
-                .taker_escrow
-                .their_pubkey
-                .unwrap()
-                .mul_tweak(&secp, &Scalar::from(self.taker_escrow.mine.secret_key()))
-                .unwrap()
-                .x_only_public_key(),
-        }
+    pub(crate) fn reveal_preimage(&self) -> Result<PreimageReveal, ()> {
+        let preimage = self.maker_escrow.preimage.as_ref().ok_or(())?;
+        Ok(PreimageReveal {
+            id: self.contract_id.clone(),
+            preimage: preimage.to_string()
+        })
     }
 
-    fn _calculate_escrow_privkey(&self, role: Role) -> SecretKey {
-        match role {
-            Role::Maker => self
-                .maker_escrow
-                .their_privkey
-                .unwrap()
-                .mul_tweak(&Scalar::from(self.maker_escrow.mine.secret_key()))
-                .unwrap(),
-            Role::Taker => self
-                .taker_escrow
-                .their_privkey
-                .unwrap()
-                .mul_tweak(&Scalar::from(self.taker_escrow.mine.secret_key()))
-                .unwrap(),
-        }
+    pub(crate) fn accept_preimage(&mut self, preimage_reveal: PreimageReveal) {
+        // todo: check that the ID is kosher
+        self.maker_escrow.preimage = Some(preimage_reveal.preimage.clone());
+        self.taker_escrow.preimage = Some(preimage_reveal.preimage.clone());
+    }
+
+    pub(crate) fn reveal_seckey(&self) -> Result<KeyReveal, ()> {
+        Ok(KeyReveal {
+            id: self.contract_id.clone(),
+            maker_escrow_seckey: self.maker_escrow.mine.secret_key().clone(),
+            taker_escrow_seckey: self.taker_escrow.mine.secret_key().clone(),
+        })
+    }
+
+    pub(crate) fn accept_seckey(&mut self, key_reveal: KeyReveal) {
+        // todo: validate id
+        self.maker_escrow.their_privkey = Some(key_reveal.maker_escrow_seckey);
+        self.taker_escrow.their_privkey = Some(key_reveal.taker_escrow_seckey);
+    }
+
+    fn calculate_escrow_pubkey(&self, role: Role) -> (XOnlyPublicKey, Parity) {
+        let secp = Secp256k1::new();
+        let escrow = match role {
+            Role::Maker => &self.maker_escrow,
+            Role::Taker => &self.taker_escrow
+        };
+        escrow.their_pubkey.unwrap().mul_tweak(&secp, &Scalar::from(escrow.mine.secret_key())).unwrap().x_only_public_key()
+    }
+
+
+    fn calculate_escrow_privkey(&self, escrow: &Escrow) -> SecretKey {
+        escrow.their_privkey.unwrap().mul_tweak(&Scalar::from(escrow.mine.secret_key())).unwrap()
     }
 
     fn build_taproot_spend_info(&self, role: Role) -> TaprootSpendInfo {
         let secp = Secp256k1::new();
-        let (timelock_blocks, hashlock) = match role {
-            Role::Maker => (
-                self.maker_escrow.timelock.unwrap(),
-                self.maker_escrow.hashlock.clone(),
-            ),
-            Role::Taker => (
-                self.taker_escrow.timelock.unwrap(),
-                self.taker_escrow.hashlock.clone(),
-            ),
+
+        let escrow = match role {
+            Role::Maker => &self.taker_escrow,
+            Role::Taker => &self.maker_escrow,
         };
-        let (timelock_key, hashlock_key) = match role {
-            Role::Maker => match self.role {
-                Role::Maker => (
-                    self.maker_escrow.mine.x_only_public_key().0,
-                    self.maker_escrow
-                        .their_pubkey
-                        .unwrap()
-                        .x_only_public_key()
-                        .0,
-                ),
-                Role::Taker => (
-                    self.maker_escrow
-                        .their_pubkey
-                        .unwrap()
-                        .x_only_public_key()
-                        .0,
-                    self.maker_escrow.mine.x_only_public_key().0,
-                ),
-            },
-            Role::Taker => match self.role {
-                Role::Maker => (
-                    self.taker_escrow
-                        .their_pubkey
-                        .unwrap()
-                        .x_only_public_key()
-                        .0,
-                    self.taker_escrow.mine.x_only_public_key().0,
-                ),
-                Role::Taker => (
-                    self.taker_escrow.mine.x_only_public_key().0,
-                    self.taker_escrow
-                        .their_pubkey
-                        .unwrap()
-                        .x_only_public_key()
-                        .0,
-                ),
-            },
+
+        let timelock_blocks = escrow.timelock.unwrap();
+        let hashlock = escrow.hashlock.clone();
+        let (timelock_key, hashlock_key) = if role == self.role {
+            (escrow.mine.x_only_public_key().0, escrow.their_pubkey.unwrap().x_only_public_key().0)
+        } else {
+            (escrow.their_pubkey.unwrap().x_only_public_key().0, escrow.mine.x_only_public_key().0)
         };
+
         TaprootBuilder::new()
             .add_leaf(
                 1u8,
@@ -289,13 +275,12 @@ impl Contract {
     }
 
     fn get_spend_path(&self, confirmations: u32) -> SpendPath {
-        if confirmations < 1 {
+        if confirmations < REQUIRED_CONFIRMATIONS {
             return SpendPath::Unspendable;
         }
-        // TODO: We need to check the timelock on OUR escrow and the hashlock/keys on the OTHER escrow
         let escrow = match self.role {
-            Role::Maker => &self.taker_escrow,
-            Role::Taker => &self.maker_escrow,
+            Role::Maker => &self.maker_escrow,
+            Role::Taker => &self.taker_escrow,
         };
         if escrow.their_privkey.is_some() {
             return SpendPath::Keypath;
@@ -314,12 +299,10 @@ impl Contract {
     /// Get a signed, ready-to-send TX that spends the contract
     fn get_spending_tx(
         &self,
-        utxo: &ListUnspentResultEntry,
+        utxo: &Utxo,
         address: Address,
         fee_rate: Option<u64>,
     ) -> Result<Transaction, ()> {
-        // TODO: we need to spend our escrow in a timelock spend and the other escrow otherwise
-        // wait. we should make sure that our escrow object is always the right one....
         let escrow = match self.role {
             Role::Maker => &self.taker_escrow,
             Role::Taker => &self.maker_escrow,
@@ -423,8 +406,8 @@ impl Contract {
                     )
                     .unwrap();
                 let message = secp256k1::Message::from(sighash);
-                let tweaked_keypair = escrow
-                    .mine
+                let tweaked_keypair = self.calculate_escrow_privkey(&escrow)
+                    .keypair(&secp)
                     .add_xonly_tweak(
                         &secp,
                         &self
@@ -499,13 +482,13 @@ impl From<Proposal> for Contract {
             their_privkey: None,
             preimage: None,
             hashlock: value.hashlock,
-            timelock: Some(value.maker_timelock + 10),
+            timelock: Some(value.maker_timelock - 10), // taker should have a shorter timelock because they're at disadvantage for the hashlock
         };
 
         Contract {
             contract_id: value.id,
             network: value.network,
-            state: ContractState::Proposed,
+            state: Proposed,
             role: Role::Taker,
             maker_escrow,
             taker_escrow,
@@ -537,7 +520,7 @@ fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
 mod tests {
     use bitcoin::Network;
 
-    use crate::swap::contract::{Contract, ContractState, FinalizeDeal, Offer, Proposal, Role};
+    use crate::swap::contract::{Contract, ContractState, FinalizeDeal, Offer, Proposal, Role, SpendPath};
 
     #[test]
     fn test_contract_construction() {
@@ -591,5 +574,19 @@ mod tests {
         assert_eq!(maker_generated_maker_address, taker_generated_maker_address);
         assert_eq!(maker_generated_taker_address, taker_generated_taker_address);
         // end checks -- at this point we have both parties generating the same p2tr! woohoo!
+
+        assert_eq!(maker.get_spend_path(0), SpendPath::Unspendable);
+        assert_eq!(taker.get_spend_path(133), SpendPath::Unspendable);
+        assert_eq!(taker.get_spend_path(134), SpendPath::Timelock);
+        let preimage_reveal = maker.reveal_preimage().unwrap();
+        taker.accept_preimage(preimage_reveal);
+        assert_eq!(taker.get_spend_path(1), SpendPath::Hashlock);
+        assert_eq!(maker.get_spend_path(1), SpendPath::Hashlock);
+        let maker_key_reveal = maker.reveal_seckey().unwrap();
+        let taker_key_reveal = taker.reveal_seckey().unwrap();
+        maker.accept_seckey(taker_key_reveal);
+        assert_eq!(maker.get_spend_path(1), SpendPath::Keypath);
+        taker.accept_seckey(maker_key_reveal);
+        assert_eq!(taker.get_spend_path(1), SpendPath::Keypath);
     }
 }
