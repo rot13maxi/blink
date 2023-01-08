@@ -70,15 +70,6 @@ enum BlinkCommand {
     Dump {id: String}
 }
 
-/// Protocol is something like:
-/// Alice and Bob
-/// Alice -> Bob: Offer(id, PubKeys, Hashlock, myTimelock, amount)
-/// Bob -> Alice: Propose(id, PubKeys, myTimelock)
-/// Alice -> Bob: Accept(id)
-/// Bob -> Alice: Accept(id)
-/// Alice -> Bob: Reveal(id, preImage)
-/// Bob -> Alice: Close(id, secKey)
-/// Alice -> Bob: Close(id, secKey)
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -242,7 +233,7 @@ fn main() -> anyhow::Result<()> {
                     let spend_tx = contract.get_spending_tx(&utxo, Address::from_str("bcrt1qvqqlv224wflslj2g3wkq6kxm5thvagcac56ktj").unwrap(), None).unwrap();
                     println!("{}", spend_tx.serialize().to_hex());
                 }
-                
+
                 BlinkCommand::Dump { id } =>
                     {
                         let contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();

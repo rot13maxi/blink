@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
@@ -17,112 +18,14 @@ use serde_json::json;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use uuid::Uuid;
+use crate::swap::components::{EscrowKeys, Hashlock, Timelock};
+use crate::swap::role::Role;
 
-use crate::swap::contract::ContractState::{Init, Proposed};
 use crate::swap::utxo::Utxo;
 
 const DEFAULT_TIMELOCK: u16 = 144;
 const REQUIRED_CONFIRMATIONS: u32 = 1;
 
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct Proposal {
-    id: String,
-    network: Network,
-    maker_pubkey: PublicKey,
-    taker_pubkey: PublicKey,
-    hashlock: String,
-    maker_timelock: u16,
-    amount: u64,
-    // TODO: contract expiry?
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct Offer {
-    id: String,
-    maker_pubkey: PublicKey,
-    taker_pubkey: PublicKey,
-    taker_timelock: u16,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct FinalizeDeal {
-    id: String,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct PreimageReveal {
-    id: String,
-    preimage: String,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct KeyReveal {
-    id: String,
-    maker_escrow_seckey: SecretKey,
-    taker_escrow_seckey: SecretKey,
-}
-
-#[derive(Deserialize, serde::Serialize, PartialEq, Debug)]
-pub(crate) enum ContractState {
-    Init,
-    Offered,
-    Proposed,
-    Accepted,
-    Cancelled,
-    Locked,
-    HashRevealed,
-    KeyRevealed,
-    TimedOut,
-    Closed,
-}
-
-#[derive(Deserialize, serde::Serialize, Clone, PartialEq, Debug)]
-pub(crate) enum Role {
-    Maker,
-    Taker,
-}
-
-impl Role {
-    fn other(&self) -> Role {
-        match self {
-            Role::Maker => Role::Taker,
-            Role::Taker => Role::Maker,
-        }
-    }
-}
-
-impl FromStr for Role {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s == "maker" || s == "Maker" {
-            Ok(Role::Maker)
-        } else if s == "taker" || s == "Taker" {
-            Ok(Role::Taker)
-        } else {
-            Err(())
-        }
-    }
-}
-
-impl Display for Role {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Role::Maker => f.write_str("Maker"),
-            Role::Taker => f.write_str("Taker"),
-        }
-    }
-}
-
-#[derive(Deserialize, serde::Serialize, Debug)]
-struct Escrow {
-    mine: KeyPair,
-    their_pubkey: Option<PublicKey>,
-    their_privkey: Option<SecretKey>,
-    preimage: Option<String>,
-    hashlock: String,
-    timelock: Option<u16>,
-}
 
 #[derive(PartialEq, Debug)]
 enum SpendPath {
@@ -135,11 +38,10 @@ enum SpendPath {
 #[derive(Deserialize, serde::Serialize, Debug)]
 pub struct Contract {
     contract_id: String,
-    network: Network,
-    pub(crate) state: ContractState,
-    pub(crate) role: Role,
-    maker_escrow: Escrow,
-    taker_escrow: Escrow,
+    escrow_keys: HashMap<Role, EscrowKeys>,
+    hashlock: Hashlock,
+    timelock: Timelock,
+    utxo: Option<Utxo>,
 }
 
 impl Contract {
