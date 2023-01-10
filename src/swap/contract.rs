@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Formatter;
 
 use bitcoin::blockdata::opcodes::all::{OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
@@ -270,3 +269,6 @@ impl Contract {
         Ok(tx)
     }
 }
+
+#[cfg(test)]
+mod tests {}

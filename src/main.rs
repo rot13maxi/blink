@@ -104,7 +104,10 @@ fn main() -> anyhow::Result<()> {
     let tree = sled::open(cli.db_path)?;
 
     let rpc_client = Client::new(
-        &format!("http://{}:{}", cli.rpc_host, cli.rpc_port),
+        &format!(
+            "http://{}:{}/wallet/{}",
+            cli.rpc_host, cli.rpc_port, cli.wallet_name
+        ),
         if cli.rpc_username.is_some() {
             Auth::UserPass("test".to_string(), "test".to_string())
         } else {
@@ -113,31 +116,17 @@ fn main() -> anyhow::Result<()> {
     )
     .expect("Couldn't make RPC client");
 
-    let mut need_to_load_or_create = true;
-    if let Ok(wallets) = rpc_client.list_wallets() {
-        if wallets.len() == 1 && &wallets[0] == &cli.wallet_name {
-            need_to_load_or_create = false;
-        } else if wallets.len() > 0 {
-            wallets.iter().for_each(|wallet| {
-                if wallet == &cli.wallet_name {
-                    need_to_load_or_create = false;
-                } else {
-                    println!("unloading {} so we don't accidentially touch it", wallet);
-                    rpc_client
-                        .unload_wallet(Some(wallet))
-                        .expect("Could not unload wallet");
-                }
-            });
-        }
-    }
-    if need_to_load_or_create {
-        if let Err(_) = rpc_client.load_wallet(&cli.wallet_name) {
-            println!("Creating new wallet named {}", &cli.wallet_name);
-            rpc_client.create_wallet(&cli.wallet_name, Some(true), None, None, None)?;
-        }
-        println!("Wallet loaded");
+    if rpc_client.list_wallets()?.contains(&cli.wallet_name) {
+        println!("wallet already loaded: {}", &cli.wallet_name);
+    } else if rpc_client.list_wallet_dir()?.contains(&cli.wallet_name) {
+        rpc_client.load_wallet(&cli.wallet_name)?;
+        println!("wallet loaded: {}", &cli.wallet_name);
+    } else {
+        rpc_client.create_wallet(&cli.wallet_name, Some(true), None, None, None)?;
+        println!("created wallet: {}", &cli.wallet_name);
     }
 
+    println!("balance: {}", rpc_client.get_balance(None, None)?);
     Ok(())
 }
 

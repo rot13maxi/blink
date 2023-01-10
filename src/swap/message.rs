@@ -1,41 +1,57 @@
+use crate::swap::role::Role;
 use bitcoin::secp256k1::SecretKey;
-use bitcoin::{Network, PublicKey};
+use bitcoin::{Address, Network, PublicKey};
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
+pub(crate) enum SwapMessage {
+    Proposal(Proposal),
+    Offer(Offer),
+    OfferResponse(OfferResponse),
+    AddressConfirmation(AddressConfirmation),
+    PreimageReveal(PreimageReveal),
+    KeyReveal(KeyReveal),
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct Proposal {
-    id: String,
-    network: Network,
-    maker_pubkey: PublicKey,
-    taker_pubkey: PublicKey,
-    hashlock: String,
-    maker_timelock: u16,
+    swap_id: String,
     amount: u64,
-    // TODO: contract expiry?
+    expiration: u64,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 pub(crate) struct Offer {
-    id: String,
-    maker_pubkey: PublicKey,
-    taker_pubkey: PublicKey,
-    taker_timelock: u16,
+    swap_id: String,
+    initiator_escrow_pubkey: PublicKey,
+    participant_escrow_pubkey: PublicKey,
+    participant_timelock: u32,
+    hashlock: String,
 }
 
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct FinalizeDeal {
-    id: String,
+#[derive(Deserialize, Serialize)]
+pub(crate) struct OfferResponse {
+    swap_id: String,
+    initiator_escrow_pubkey: PublicKey,
+    participant_escrow_pubkey: PublicKey,
+    initiator_timelock: u32,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
+pub(crate) struct AddressConfirmation {
+    swap_id: String,
+    address: Address,
+    role: Role,
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct PreimageReveal {
-    id: String,
+    swap_id: String,
     preimage: String,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 pub(crate) struct KeyReveal {
-    id: String,
-    maker_escrow_seckey: SecretKey,
-    taker_escrow_seckey: SecretKey,
+    swap_id: String,
+    seckey: SecretKey,
 }

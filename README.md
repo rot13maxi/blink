@@ -30,3 +30,4 @@ Before getting to `Deposited`, if `n` seconds elapse without a state transition,
 - handle multiple UTXOs associated with a contract
 - put an index in the taptree so we can have different scriptpubkeys associated with the same contract for multi-tx swaps
 - change contract escrow to `map<Role, Escrow>`
+- allow cookie auth for talking to bitcoind
