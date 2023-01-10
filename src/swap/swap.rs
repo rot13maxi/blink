@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use bitcoin::{Address, Network};
 use crate::swap::contract::Contract;
 use crate::swap::role::Role;
+use bitcoin::{Address, Network};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) enum SwapState {

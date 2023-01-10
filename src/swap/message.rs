@@ -1,5 +1,5 @@
-use bitcoin::{Network, PublicKey};
 use bitcoin::secp256k1::SecretKey;
+use bitcoin::{Network, PublicKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, serde::Serialize)]

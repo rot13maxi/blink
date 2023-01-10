@@ -1,20 +1,20 @@
 use std::collections::HashMap;
 use std::fmt::Formatter;
 
-use bitcoin::{
-    Address, KeyPair, Network, OutPoint, PackedLockTime, schnorr, SchnorrSighashType, Script,
-    secp256k1, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
-};
 use bitcoin::blockdata::opcodes::all::{OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
-use bitcoin::hashes::{Hash, sha256};
 use bitcoin::hashes::hex::ToHex;
-use bitcoin::psbt::Prevouts;
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::psbt::serialize::Serialize;
+use bitcoin::psbt::Prevouts;
 use bitcoin::secp256k1::{Parity, Scalar, Secp256k1, SecretKey};
 use bitcoin::util::sighash::SighashCache;
 use bitcoin::util::taproot::{
     LeafVersion, TapLeafHash, TaprootBuilder, TaprootBuilderError, TaprootSpendInfo,
+};
+use bitcoin::{
+    schnorr, secp256k1, Address, KeyPair, Network, OutPoint, PackedLockTime, SchnorrSighashType,
+    Script, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
 };
 use rand::Rng;
 use serde::Deserialize;
@@ -165,7 +165,8 @@ impl Contract {
                 script_pubkey: destination.script_pubkey(),
             }],
         };
-        let prevout: Vec<TxOut> = vec![self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.into()];
+        let prevout: Vec<TxOut> =
+            vec![self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.into()];
         let secp = Secp256k1::new();
         let mut sighash_cache = SighashCache::new(&tx);
         let witness = match spend_path {
@@ -204,17 +205,31 @@ impl Contract {
                         0,
                         &Prevouts::All(&prevout),
                         TapLeafHash::from_script(&hashlock_script, LeafVersion::TapScript),
-                        SchnorrSighashType::Default
-                    ).map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
+                        SchnorrSighashType::Default,
+                    )
+                    .map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
                 let message = secp256k1::Message::from(sighash);
-                let keypair = KeyPair::from_secret_key(&secp, &self.hashlock.seckey.ok_or(ContractError::NoPrivKeys)?);
+                let keypair = KeyPair::from_secret_key(
+                    &secp,
+                    &self.hashlock.seckey.ok_or(ContractError::NoPrivKeys)?,
+                );
                 let signature = secp.sign_schnorr(&message, &keypair);
-                let final_sig = schnorr::SchnorrSig{sig: signature, hash_ty: SchnorrSighashType::Default};
+                let final_sig = schnorr::SchnorrSig {
+                    sig: signature,
+                    hash_ty: SchnorrSighashType::Default,
+                };
                 vec![
                     final_sig.serialize(),
-                    Vec::from(self.hashlock.preimage.as_ref().ok_or(ContractError::PreimageMissing)?.clone().as_bytes()),
+                    Vec::from(
+                        self.hashlock
+                            .preimage
+                            .as_ref()
+                            .ok_or(ContractError::PreimageMissing)?
+                            .clone()
+                            .as_bytes(),
+                    ),
                     hashlock_script.serialize(),
-                    control_block.serialize()
+                    control_block.serialize(),
                 ]
             }
             SpendPath::Timelock => {
@@ -229,9 +244,13 @@ impl Contract {
                         &Prevouts::All(&prevout),
                         TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript),
                         SchnorrSighashType::Default,
-                    ).map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
+                    )
+                    .map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
                 let message = secp256k1::Message::from(sighash);
-                let keypair =  KeyPair::from_secret_key(&secp, &self.timelock.seckey.ok_or(ContractError::NoPrivKeys)?);
+                let keypair = KeyPair::from_secret_key(
+                    &secp,
+                    &self.timelock.seckey.ok_or(ContractError::NoPrivKeys)?,
+                );
                 let signature = secp.sign_schnorr(&message, &keypair);
                 let final_sig = schnorr::SchnorrSig {
                     sig: signature,
@@ -240,7 +259,7 @@ impl Contract {
                 vec![
                     final_sig.serialize(),
                     timelock_script.serialize(),
-                    control_block.serialize()
+                    control_block.serialize(),
                 ]
             }
         };

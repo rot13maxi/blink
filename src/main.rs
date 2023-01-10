@@ -1,12 +1,9 @@
-
-
-use anyhow::{bail};
+use anyhow::bail;
 use bitcoin::{Address, Network};
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 
 use clap::{Parser, Subcommand};
-
 
 mod swap;
 
@@ -52,25 +49,55 @@ enum Commands {
 enum BlinkCommand {
     CreateContract,
     ListContracts,
-    Propose { id: String },
-    Offer { proposal_blob: String },
-    AcceptOffer {id: String, accept_offer_blob: String},
-    FinalizeDeal {id: String, finalize_deal_blob: String},
-    GetAddress {id: String, role: String},
-    GetLocked {id: String},
-    RevealPreimage {id: String},
-    AcceptPreimage {id: String, preimage_blob: String},
-    RevealKeys {id: String},
-    AcceptKeys {id: String, seckey_blob: String},
-    Close {id: String},
-    Dump {id: String}
+    Propose {
+        id: String,
+    },
+    Offer {
+        proposal_blob: String,
+    },
+    AcceptOffer {
+        id: String,
+        accept_offer_blob: String,
+    },
+    FinalizeDeal {
+        id: String,
+        finalize_deal_blob: String,
+    },
+    GetAddress {
+        id: String,
+        role: String,
+    },
+    GetLocked {
+        id: String,
+    },
+    RevealPreimage {
+        id: String,
+    },
+    AcceptPreimage {
+        id: String,
+        preimage_blob: String,
+    },
+    RevealKeys {
+        id: String,
+    },
+    AcceptKeys {
+        id: String,
+        seckey_blob: String,
+    },
+    Close {
+        id: String,
+    },
+    Dump {
+        id: String,
+    },
 }
-
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if (cli.rpc_username.is_some() && cli.rpc_password.is_none()) || (cli.rpc_username.is_none() && cli.rpc_password.is_some()) {
+    if (cli.rpc_username.is_some() && cli.rpc_password.is_none())
+        || (cli.rpc_username.is_none() && cli.rpc_password.is_some())
+    {
         bail!("You need to provide an rpc user AND password, or neither")
     }
 
@@ -80,9 +107,11 @@ fn main() -> anyhow::Result<()> {
         &format!("http://{}:{}", cli.rpc_host, cli.rpc_port),
         if cli.rpc_username.is_some() {
             Auth::UserPass("test".to_string(), "test".to_string())
-        } else {Auth::None}
+        } else {
+            Auth::None
+        },
     )
-        .expect("Couldn't make RPC client");
+    .expect("Couldn't make RPC client");
 
     let mut need_to_load_or_create = true;
     if let Ok(wallets) = rpc_client.list_wallets() {
@@ -94,7 +123,9 @@ fn main() -> anyhow::Result<()> {
                     need_to_load_or_create = false;
                 } else {
                     println!("unloading {} so we don't accidentially touch it", wallet);
-                    rpc_client.unload_wallet(Some(wallet)).expect("Could not unload wallet");
+                    rpc_client
+                        .unload_wallet(Some(wallet))
+                        .expect("Could not unload wallet");
                 }
             });
         }
@@ -107,14 +138,20 @@ fn main() -> anyhow::Result<()> {
         println!("Wallet loaded");
     }
 
-
-
     Ok(())
 }
 
-fn escrow_confirmed(client: &Client, min_conf: usize, address: &Address, amount: u64) -> anyhow::Result<bool> {
+fn escrow_confirmed(
+    client: &Client,
+    min_conf: usize,
+    address: &Address,
+    amount: u64,
+) -> anyhow::Result<bool> {
     let unspent = client.list_unspent(Some(min_conf), None, Some(&[address]), None, None)?;
-    let sum = unspent.iter().map(|utxo|utxo.amount.to_sat()).fold(0u64, |acc, x| acc + x);
+    let sum = unspent
+        .iter()
+        .map(|utxo| utxo.amount.to_sat())
+        .fold(0u64, |acc, x| acc + x);
     if sum >= amount && sum != 0 {
         Ok(true)
     } else {

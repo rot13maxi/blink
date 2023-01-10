@@ -36,7 +36,7 @@ impl From<&Utxo> for TxOut {
     fn from(value: &Utxo) -> Self {
         TxOut {
             script_pubkey: value.script_pub_key.clone(),
-            value: value.amount
+            value: value.amount,
         }
     }
 }

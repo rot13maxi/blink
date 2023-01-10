@@ -1,12 +1,11 @@
-use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use bitcoin::{Script, XOnlyPublicKey};
 use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
-use bitcoin::hashes::{Hash, sha256};
 use bitcoin::hashes::hex::ToHex;
+use bitcoin::hashes::{sha256, Hash};
+use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
+use bitcoin::{Script, XOnlyPublicKey};
 use rand::Rng;
-use serde::{Serialize, Deserialize};
-
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) struct EscrowKeys {
@@ -26,7 +25,14 @@ impl EscrowKeys {
 
     pub(crate) fn calculate_shared_pubkey(&self, other: &EscrowKeys) -> Option<XOnlyPublicKey> {
         let secp = Secp256k1::new();
-        Some(other.pubkey?.mul_tweak(&secp, &Scalar::from(self.seckey?)).ok()?.x_only_public_key().0)
+        Some(
+            other
+                .pubkey?
+                .mul_tweak(&secp, &Scalar::from(self.seckey?))
+                .ok()?
+                .x_only_public_key()
+                .0,
+        )
     }
 
     pub(crate) fn calculate_shared_seckey(&self, other: &EscrowKeys) -> Option<SecretKey> {
@@ -38,7 +44,7 @@ impl From<PublicKey> for EscrowKeys {
     fn from(value: PublicKey) -> Self {
         Self {
             seckey: None,
-            pubkey: Some(value)
+            pubkey: Some(value),
         }
     }
 }
@@ -56,7 +62,7 @@ impl Hashlock {
         let secp = Secp256k1::new();
         let mut rng = rand::thread_rng();
         let (seckey, pubkey) = secp.generate_keypair(&mut rng);
-        let preimage_bytes: [u8;32] = rng.gen();
+        let preimage_bytes: [u8; 32] = rng.gen();
         let preimage = preimage_bytes.to_hex();
         let hash = sha256::Hash::hash(preimage.as_bytes());
         Self {
