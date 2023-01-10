@@ -1,4 +1,4 @@
-use bitcoin::{Amount, Script};
+use bitcoin::{Amount, OutPoint, Script, TxOut};
 use bitcoincore_rpc::json::ListUnspentResultEntry;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,24 @@ impl From<ListUnspentResultEntry> for Utxo {
             script_pub_key: value.script_pub_key,
             amount: value.amount.to_sat(),
             confirmations: value.confirmations,
+        }
+    }
+}
+
+impl From<&Utxo> for OutPoint {
+    fn from(value: &Utxo) -> Self {
+        OutPoint {
+            txid: value.txid,
+            vout: value.vout,
+        }
+    }
+}
+
+impl From<&Utxo> for TxOut {
+    fn from(value: &Utxo) -> Self {
+        TxOut {
+            script_pubkey: value.script_pub_key.clone(),
+            value: value.amount
         }
     }
 }

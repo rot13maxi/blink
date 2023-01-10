@@ -1,33 +1,31 @@
 use std::collections::HashMap;
-use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
+use std::fmt::Formatter;
+
+use bitcoin::{
+    Address, KeyPair, Network, OutPoint, PackedLockTime, schnorr, SchnorrSighashType, Script,
+    secp256k1, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
+};
+use bitcoin::blockdata::opcodes::all::{OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
+use bitcoin::hashes::{Hash, sha256};
 use bitcoin::hashes::hex::ToHex;
-use bitcoin::hashes::{sha256, Hash};
-use bitcoin::psbt::serialize::Serialize;
 use bitcoin::psbt::Prevouts;
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::psbt::serialize::Serialize;
 use bitcoin::secp256k1::{Parity, Scalar, Secp256k1, SecretKey};
 use bitcoin::util::sighash::SighashCache;
-use bitcoin::util::taproot::{LeafVersion, TapLeafHash, TaprootBuilder, TaprootBuilderError, TaprootSpendInfo};
-use bitcoin::{
-    schnorr, secp256k1, Address, KeyPair, Network, OutPoint, PackedLockTime,
-    SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
+use bitcoin::util::taproot::{
+    LeafVersion, TapLeafHash, TaprootBuilder, TaprootBuilderError, TaprootSpendInfo,
 };
-use serde::Deserialize;
-use serde_json::json;
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
 use rand::Rng;
-use uuid::Uuid;
+use serde::Deserialize;
+use thiserror::Error;
+
 use crate::swap::components::{EscrowKeys, Hashlock, Timelock};
 use crate::swap::role::Role;
-
-use crate::swap::utxo::Utxo;
-use thiserror::Error;
-use crate::swap::contract::ContractError::{TaprootBuilderError, TapTreeError};
 use crate::swap::role::Role::{Initiator, Participant};
+use crate::swap::utxo::Utxo;
 
-const DEFAULT_TIMELOCK: u32 = 144; // blocks
+const DEFAULT_TIMELOCK: u16 = 144; // blocks
 const REQUIRED_CONFIRMATIONS: u32 = 1; // blocks
 
 #[derive(Error, Debug)]
@@ -38,11 +36,28 @@ pub enum ContractError {
     NoPrivKeys,
     #[error("could not construct taptree: `{0}`")]
     TapTreeError(TaprootBuilderError),
-    #[error("could not construct taproot info: `{0}`")]
-    TaprootBuilderError(TaprootBuilder),
+    #[error("could not finalize taproot info`")]
+    TaprootFinalizationError,
+    #[error("could not construct transaction: `{0}")]
+    TransactionConstructionError(String),
+    #[error("no UTXO found for contract")]
+    NoUtxoError,
+    #[error("could not construct sighash: `{0}`")]
+    ScriptHashError(String),
+    #[error("can't tweak private key: `{0}1")]
+    CantTweakKey(String),
+    #[error("missing hashlock preimage")]
+    PreimageMissing,
 }
 
 type Result<T> = std::result::Result<T, ContractError>;
+
+#[derive(PartialEq)]
+pub enum SpendPath {
+    KeyPath,
+    Hashlock,
+    Timelock,
+}
 
 #[derive(Deserialize, serde::Serialize, Debug)]
 pub struct Contract {
@@ -56,7 +71,7 @@ pub struct Contract {
 impl Contract {
     pub fn new(network: Network) -> Self {
         let mut rng = rand::thread_rng();
-        let contract_id_bytes: [u8;32] = rng.gen();
+        let contract_id_bytes: [u8; 32] = rng.gen();
         let contract_id = contract_id_bytes.to_hex();
         let mut escrow_keys = HashMap::new();
         escrow_keys.insert(Role::Initiator, EscrowKeys::new());
@@ -72,8 +87,14 @@ impl Contract {
     }
 
     fn calculate_shared_pubkey(&self) -> Result<XOnlyPublicKey> {
-        let initiator_escrow = self.escrow_keys.get(&Initiator).ok_or(ContractError::MissingKeys(Initiator))?;
-        let participant_escrow = self.escrow_keys.get(&Participant).ok_or(ContractError::MissingKeys(Participant))?;
+        let initiator_escrow = self
+            .escrow_keys
+            .get(&Initiator)
+            .ok_or(ContractError::MissingKeys(Initiator))?;
+        let participant_escrow = self
+            .escrow_keys
+            .get(&Participant)
+            .ok_or(ContractError::MissingKeys(Participant))?;
         if let Some(pubkey) = initiator_escrow.calculate_shared_pubkey(participant_escrow) {
             Ok(pubkey)
         } else if let Some(pubkey) = participant_escrow.calculate_shared_pubkey(initiator_escrow) {
@@ -83,167 +104,149 @@ impl Contract {
         }
     }
 
-    fn build_taproot_spend_info(&self, role: Role) -> Result<TaprootSpendInfo> {
+    fn calculate_shared_seckey(&self) -> Result<SecretKey> {
+        let initiator_seckey = self
+            .escrow_keys
+            .get(&Initiator)
+            .ok_or(ContractError::MissingKeys(Initiator))?;
+        let participant_escrow = self
+            .escrow_keys
+            .get(&Participant)
+            .ok_or(ContractError::MissingKeys(Participant))?;
+        initiator_seckey
+            .calculate_shared_seckey(participant_escrow)
+            .ok_or(ContractError::NoPrivKeys)
+    }
+
+    fn build_taproot_spend_info(&self) -> Result<TaprootSpendInfo> {
         let secp = Secp256k1::new();
         Ok(TaprootBuilder::new()
-            .add_leaf(
-                1u8,
-                self.hashlock.build_script(),
-            )
-            .map_err(|err| TapTreeError(err))?
-            .add_leaf(
-                1u8,
-                self.timelock.build_script(),
-            )
-            .map_err(|err| TapTreeError(err))?
+            .add_leaf(1u8, self.hashlock.build_script())
+            .map_err(|err| ContractError::TapTreeError(err))?
+            .add_leaf(1u8, self.timelock.build_script())
+            .map_err(|err| ContractError::TapTreeError(err))?
             .finalize(&secp, self.calculate_shared_pubkey()?)
-            .map_err(|err| TaprootBuilderError(err))?)
+            .map_err(|_| ContractError::TaprootFinalizationError)?)
     }
 
-    pub(crate) fn get_address(&self, network: Network) -> Address {
-        Address::p2tr_tweaked(
-            self.build_taproot_spend_info().output_key(),
+    pub(crate) fn get_address(&self, network: Network) -> Result<Address> {
+        Ok(Address::p2tr_tweaked(
+            self.build_taproot_spend_info()?.output_key(),
             network,
-        )
+        ))
     }
-
 
     /// Get a signed, ready-to-send TX that spends the contract
     pub fn get_spending_tx(
         &self,
-        utxo: &Utxo,
-        address: Address,
+        spend_path: SpendPath,
+        destination: Address,
         fee_rate: Option<u64>,
-    ) -> Result<Transaction, ()> {
-        let spend_path = self.get_spend_path(utxo.confirmations);
-        // my escrow for timelock, their escrow otherwise
-        let escrow = if spend_path == SpendPath::Timelock {
-            match self.role {
-                Role::Initiator => &self.maker_escrow,
-                Role::Participant => &self.taker_escrow,
-            }
-        } else {
-            match self.role {
-                Role::Initiator => &self.taker_escrow,
-                Role::Participant => &self.maker_escrow,
-            }
-        };
-        let prev_outpoint = OutPoint {
-            txid: utxo.txid,
-            vout: utxo.vout,
-        };
-        let prev_txout = TxOut {
-            value: utxo.amount.to_sat(),
-            script_pubkey: utxo.script_pub_key.clone(),
-        };
-        let vbytes = 600; // totally just made up number. todo: calculate this
-        let fee = vbytes * fee_rate.unwrap_or(1);
-        let mut tx = Transaction {
+    ) -> Result<Transaction> {
+        // TODO: actually calculate transaction size so we can do better fee calculation
+        // Just picking a number for now. will probably be overpaying in most cases
+        let tx_vbytes = 600;
+        let fee = tx_vbytes * fee_rate.unwrap_or(1);
+        let mut tx: Transaction = Transaction {
             version: 2,
             lock_time: PackedLockTime::ZERO,
             input: vec![TxIn {
-                previous_output: prev_outpoint,
+                previous_output: self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.into(),
+                script_sig: script::Builder::new().into_script(),
                 sequence: if spend_path == SpendPath::Timelock {
-                    Sequence::from_height(escrow.timelock.unwrap())
+                    Sequence::from_height(self.timelock.nblocks)
                 } else {
                     Sequence::MAX
                 },
-                script_sig: script::Builder::new().into_script(),
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: utxo.amount.to_sat() - fee,
-                script_pubkey: address.script_pubkey(),
+                value: self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.amount - fee,
+                script_pubkey: destination.script_pubkey(),
             }],
         };
-        let prevout = vec![prev_txout];
+        let prevout: Vec<TxOut> = vec![self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.into()];
         let secp = Secp256k1::new();
         let mut sighash_cache = SighashCache::new(&tx);
-        // build and push tx witness based on what kind of tx we're doing
-        match spend_path {
-            SpendPath::Unspendable => return Err(()),
-            SpendPath::Timelock => {
-                let timelock_script = build_timelock_script(
-                    escrow.timelock.unwrap() as i64,
-                    &escrow.mine.x_only_public_key().0,
-                );
-                let control_block = self
-                    .build_taproot_spend_info(self.role.clone())
-                    .control_block(&(timelock_script.clone(), LeafVersion::TapScript))
-                    .unwrap();
-                let sighash = sighash_cache
-                    .taproot_script_spend_signature_hash(
-                        0,
-                        &Prevouts::All(&prevout),
-                        TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript),
-                        SchnorrSighashType::Default,
-                    )
-                    .unwrap();
-                let message = secp256k1::Message::from(sighash);
-                let signature = secp.sign_schnorr(&message, &escrow.mine);
-                let final_sig = schnorr::SchnorrSig {
-                    sig: signature,
-                    hash_ty: SchnorrSighashType::Default,
-                };
-                tx.input[0].witness.push(final_sig.serialize());
-                tx.input[0].witness.push(timelock_script.serialize());
-                tx.input[0].witness.push(control_block.serialize());
-            }
-            SpendPath::Hashlock => {
-                let hashlock_script = build_hashlock_script(
-                    escrow.hashlock.as_bytes(),
-                    &escrow.mine.x_only_public_key().0,
-                );
-                let control_block = self
-                    .build_taproot_spend_info(self.role.other().clone())
-                    .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
-                    .unwrap();
-                let sighash = sighash_cache
-                    .taproot_script_spend_signature_hash(
-                        0,
-                        &Prevouts::All(&prevout),
-                        TapLeafHash::from_script(&hashlock_script, LeafVersion::TapScript),
-                        SchnorrSighashType::Default,
-                    )
-                    .unwrap();
-                let message = secp256k1::Message::from(sighash);
-                let signature = secp.sign_schnorr(&message, &escrow.mine);
-                let final_sig = schnorr::SchnorrSig {
-                    sig: signature,
-                    hash_ty: SchnorrSighashType::Default,
-                };
-                tx.input[0].witness.push(final_sig.serialize());
-                tx.input[0].witness.push(escrow.preimage.clone().unwrap());
-                tx.input[0].witness.push(hashlock_script.serialize());
-                tx.input[0].witness.push(control_block.serialize());
-            }
-            SpendPath::Keypath => {
+        let witness = match spend_path {
+            SpendPath::KeyPath => {
                 let sighash = sighash_cache
                     .taproot_key_spend_signature_hash(
                         0,
                         &Prevouts::All(&prevout),
                         SchnorrSighashType::Default,
                     )
-                    .unwrap();
+                    .map_err(|e| ContractError::ScriptHashError(e.to_string()))?;
                 let message = secp256k1::Message::from(sighash);
-                let tweaked_keypair = self.calculate_escrow_privkey(&escrow)
+                let tweaked_keypair = self
+                    .calculate_shared_seckey()?
                     .keypair(&secp)
                     .add_xonly_tweak(
                         &secp,
-                        &self
-                            .build_taproot_spend_info(self.role.clone())
-                            .tap_tweak()
-                            .to_scalar(),
+                        &self.build_taproot_spend_info()?.tap_tweak().to_scalar(),
                     )
-                    .unwrap();
+                    .map_err(|err| ContractError::CantTweakKey(err.to_string()))?;
                 let signature = secp.sign_schnorr(&message, &tweaked_keypair);
                 let final_sig = schnorr::SchnorrSig {
                     sig: signature,
                     hash_ty: SchnorrSighashType::Default,
                 };
-                tx.input[0].witness.push(final_sig.serialize());
+                vec![final_sig.serialize()]
+            }
+            SpendPath::Hashlock => {
+                let hashlock_script = self.hashlock.build_script();
+                let control_block = self
+                    .build_taproot_spend_info()?
+                    .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
+                    .ok_or(ContractError::TaprootFinalizationError)?;
+                let sighash = sighash_cache
+                    .taproot_script_spend_signature_hash(
+                        0,
+                        &Prevouts::All(&prevout),
+                        TapLeafHash::from_script(&hashlock_script, LeafVersion::TapScript),
+                        SchnorrSighashType::Default
+                    ).map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
+                let message = secp256k1::Message::from(sighash);
+                let keypair = KeyPair::from_secret_key(&secp, &self.hashlock.seckey.ok_or(ContractError::NoPrivKeys)?);
+                let signature = secp.sign_schnorr(&message, &keypair);
+                let final_sig = schnorr::SchnorrSig{sig: signature, hash_ty: SchnorrSighashType::Default};
+                vec![
+                    final_sig.serialize(),
+                    Vec::from(self.hashlock.preimage.as_ref().ok_or(ContractError::PreimageMissing)?.clone().as_bytes()),
+                    hashlock_script.serialize(),
+                    control_block.serialize()
+                ]
+            }
+            SpendPath::Timelock => {
+                let timelock_script = self.timelock.build_script();
+                let control_block = self
+                    .build_taproot_spend_info()?
+                    .control_block(&(timelock_script.clone(), LeafVersion::TapScript))
+                    .ok_or(ContractError::TaprootFinalizationError)?;
+                let sighash = sighash_cache
+                    .taproot_script_spend_signature_hash(
+                        0,
+                        &Prevouts::All(&prevout),
+                        TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript),
+                        SchnorrSighashType::Default,
+                    ).map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
+                let message = secp256k1::Message::from(sighash);
+                let keypair =  KeyPair::from_secret_key(&secp, &self.timelock.seckey.ok_or(ContractError::NoPrivKeys)?);
+                let signature = secp.sign_schnorr(&message, &keypair);
+                let final_sig = schnorr::SchnorrSig {
+                    sig: signature,
+                    hash_ty: SchnorrSighashType::Default,
+                };
+                vec![
+                    final_sig.serialize(),
+                    timelock_script.serialize(),
+                    control_block.serialize()
+                ]
             }
         };
+        for item in witness {
+            tx.input[0].witness.push(item);
+        }
 
         Ok(tx)
     }

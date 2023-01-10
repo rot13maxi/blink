@@ -16,7 +16,7 @@ pub(crate) struct EscrowKeys {
 
 impl EscrowKeys {
     pub(crate) fn new() -> Self {
-        let secp = Secp256k1::new()
+        let secp = Secp256k1::new();
         let (seckey, pubkey) = secp.generate_keypair(&mut rand::thread_rng());
         Self {
             pubkey: Some(pubkey),
@@ -46,9 +46,9 @@ impl From<PublicKey> for EscrowKeys {
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) struct Hashlock {
     hash: String,
-    preimage: Option<String>,
+    pub(crate) preimage: Option<String>,
     pubkey: XOnlyPublicKey,
-    seckey: Option<SecretKey>,
+    pub(crate) seckey: Option<SecretKey>,
 }
 
 impl Hashlock {
@@ -92,19 +92,19 @@ impl From<(String, XOnlyPublicKey)> for Hashlock {
 
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) struct Timelock {
-    nblocks: u32,
+    pub(crate) nblocks: u16,
     pubkey: XOnlyPublicKey,
-    seckey: Option<SecretKey>,
+    pub(crate) seckey: Option<SecretKey>,
 }
 
 impl Timelock {
-    pub(crate) fn new(nblocks: u32) -> Self {
-        let secp = Secp256k1::new()
+    pub(crate) fn new(nblocks: u16) -> Self {
+        let secp = Secp256k1::new();
         let (seckey, pubkey) = secp.generate_keypair(&mut rand::thread_rng());
         Self {
             nblocks,
             pubkey: pubkey.x_only_public_key().0,
-            seckey: Some(seckey);
+            seckey: Some(seckey),
         }
     }
     pub(crate) fn build_script(&self) -> Script {

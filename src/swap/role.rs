@@ -4,7 +4,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Clone, Hash, PartialEq, Eq, Debug)]
-pub(crate) enum Role {
+pub enum Role {
     Initiator,
     Participant,
 }
