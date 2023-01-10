@@ -156,7 +156,7 @@ fn main() -> anyhow::Result<()> {
                     let offer: Offer = serde_json::from_str(&accept_offer_blob).unwrap();
                     contract.accept_offer(offer);
                     let finalize_deal = FinalizeDeal::from(&mut contract);
-                    let address = contract.get_address(Role::Maker);
+                    let address = contract.get_address(Role::Initiator);
                     let spk = address.script_pubkey();
                     let gdi_result = rpc_client.get_descriptor_info(&format!("raw({})", spk.to_hex())).unwrap();
                     println!("Importing into wallet");
@@ -177,7 +177,7 @@ fn main() -> anyhow::Result<()> {
                     let mut taker_contract: Contract = serde_json::from_slice(tree.get(id.clone()).unwrap().unwrap().as_ref()).unwrap();
                     let finalize_deal: FinalizeDeal = serde_json::from_str(&finalize_deal_blob).unwrap();
                     taker_contract.finalize_deal(finalize_deal);
-                    let address = taker_contract.get_address(Role::Taker);
+                    let address = taker_contract.get_address(Role::Participant);
                     let spk = address.script_pubkey();
                     let gdi_result = rpc_client.get_descriptor_info(&format!("raw({})", spk.to_hex())).unwrap();
                     println!("Importing into wallet");

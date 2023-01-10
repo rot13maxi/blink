@@ -5,15 +5,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Clone, Hash, PartialEq, Eq, Debug)]
 pub(crate) enum Role {
-    Maker,
-    Taker,
+    Initiator,
+    Participant,
 }
 
 impl Role {
     fn other(&self) -> Role {
         match self {
-            Role::Maker => Role::Taker,
-            Role::Taker => Role::Maker,
+            Role::Initiator => Role::Participant,
+            Role::Participant => Role::Initiator,
         }
     }
 }
@@ -22,10 +22,10 @@ impl FromStr for Role {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s == "maker" || s == "Maker" {
-            Ok(Role::Maker)
-        } else if s == "taker" || s == "Taker" {
-            Ok(Role::Taker)
+        if s == "initiator" || s == "Initiator" || s == "init" {
+            Ok(Role::Initiator)
+        } else if s == "participant" || s == "Participant" {
+            Ok(Role::Participant)
         } else {
             Err(())
         }
@@ -35,8 +35,8 @@ impl FromStr for Role {
 impl Display for Role {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Role::Maker => f.write_str("Maker"),
-            Role::Taker => f.write_str("Taker"),
+            Role::Initiator => f.write_str("Initiator"),
+            Role::Participant => f.write_str("Participant"),
         }
     }
 }
