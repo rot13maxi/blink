@@ -1,17 +1,25 @@
 use crate::swap::role::Role;
-use bitcoin::secp256k1::SecretKey;
-use bitcoin::{Address, Network, PublicKey};
+use bitcoin::secp256k1::{PublicKey, SecretKey};
+use bitcoin::{Address, Network};
 use serde::{Deserialize, Serialize};
 use crate::swap::swap::Swap;
 
+/// Messages that are broadcast publicly
+#[derive(Deserialize, Serialize, Debug)]
+pub(crate) enum SwapAnnoucement {
+    Proposal(Proposal),
+    Closed(String), // swap_id
+}
+
+/// Messages that are exchanged between parties in a swap
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) enum SwapMessage {
-    Proposal(Proposal),
     Offer(Offer),
     OfferResponse(OfferResponse),
     AddressConfirmation(AddressConfirmation),
     PreimageReveal(PreimageReveal),
     KeyReveal(KeyReveal),
+    Cancel(Cancel),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -31,21 +39,21 @@ impl From<&Swap> for Proposal {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub(crate) struct Offer {
-    swap_id: String,
-    initiator_escrow_pubkey: PublicKey,
-    participant_escrow_pubkey: PublicKey,
-    participant_timelock: u32,
-    hashlock: String,
+    pub(crate) swap_id: String,
+    pub(crate) initiator_escrow_pubkey: PublicKey,
+    pub(crate) participant_escrow_pubkey: PublicKey,
+    pub(crate) participant_timelock: u16,
+    pub(crate) hashlock: String,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) struct OfferResponse {
-    swap_id: String,
-    initiator_escrow_pubkey: PublicKey,
-    participant_escrow_pubkey: PublicKey,
-    initiator_timelock: u32,
+    pub(crate) swap_id: String,
+    pub(crate) initiator_escrow_pubkey: PublicKey,
+    pub(crate) participant_escrow_pubkey: PublicKey,
+    pub(crate) initiator_timelock: u32,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -65,4 +73,9 @@ pub(crate) struct PreimageReveal {
 pub(crate) struct KeyReveal {
     swap_id: String,
     seckey: SecretKey,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub(crate) struct Cancel {
+    pub(crate) swap_id: String,
 }

@@ -20,6 +20,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::swap::components::{EscrowKeys, Hashlock, Timelock};
+use crate::swap::message::Offer;
 use crate::swap::role::Role;
 use crate::swap::role::Role::{Initiator, Participant};
 use crate::swap::utxo::Utxo;
@@ -47,6 +48,8 @@ pub enum ContractError {
     CantTweakKey(String),
     #[error("missing hashlock preimage")]
     PreimageMissing,
+    #[error("missing hashlock")]
+    MissingHashlock,
 }
 
 type Result<T> = std::result::Result<T, ContractError>;
@@ -58,31 +61,37 @@ pub enum SpendPath {
     Timelock,
 }
 
-#[derive(Deserialize, serde::Serialize, Debug)]
+#[derive(Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Contract {
-    contract_id: String,
-    escrow_keys: HashMap<Role, EscrowKeys>,
-    hashlock: Hashlock,
-    timelock: Timelock,
-    utxo: Option<Utxo>, // someday, this will be Option<Vec<Utxo>> and then we'll REALLY be dangerous
+    pub escrow_keys: HashMap<Role, EscrowKeys>,
+    pub hashlock: Option<Hashlock>,
+    pub timelock: Timelock,
+    pub utxo: Option<Utxo>, // someday, this will be Option<Vec<Utxo>> and then we'll REALLY be dangerous
 }
 
 impl Contract {
-    pub fn new(network: Network) -> Self {
-        let mut rng = rand::thread_rng();
-        let contract_id_bytes: [u8; 32] = rng.gen();
-        let contract_id = contract_id_bytes.to_hex();
+    pub fn new_initiator_contract(network: Network) -> Self {
+        let secp = Secp256k1::new();
+        let initiator_keys = EscrowKeys::new();
         let mut escrow_keys = HashMap::new();
-        escrow_keys.insert(Role::Initiator, EscrowKeys::new());
-        let hashlock = Hashlock::new();
-        let timelock = Timelock::new(DEFAULT_TIMELOCK);
+        escrow_keys.insert(Role::Initiator, initiator_keys.clone());
+        let timelock = Timelock::new(DEFAULT_TIMELOCK, initiator_keys.seckey.unwrap().keypair(&secp));
         Self {
-            contract_id,
             escrow_keys,
-            hashlock,
+            hashlock: None,
             timelock,
             utxo: None,
         }
+    }
+
+    pub fn create_hashlock(&mut self, hash: String, keys: EscrowKeys) {
+        let hashlock = Hashlock {
+            hash,
+            preimage: None,
+            pubkey: keys.pubkey.x_only_public_key().0,
+            seckey: keys.seckey,
+        };
+        self.hashlock = Some(hashlock);
     }
 
     fn calculate_shared_pubkey(&self) -> Result<XOnlyPublicKey> {
@@ -120,7 +129,7 @@ impl Contract {
     fn build_taproot_spend_info(&self) -> Result<TaprootSpendInfo> {
         let secp = Secp256k1::new();
         Ok(TaprootBuilder::new()
-            .add_leaf(1u8, self.hashlock.build_script())
+            .add_leaf(1u8, self.hashlock.ok_or(ContractError::MissingHashlock)?.build_script())
             .map_err(|err| ContractError::TapTreeError(err))?
             .add_leaf(1u8, self.timelock.build_script())
             .map_err(|err| ContractError::TapTreeError(err))?
@@ -194,7 +203,7 @@ impl Contract {
                 vec![final_sig.serialize()]
             }
             SpendPath::Hashlock => {
-                let hashlock_script = self.hashlock.build_script();
+                let hashlock_script = self.hashlock.ok_or(ContractError::MissingHashlock)?.build_script();
                 let control_block = self
                     .build_taproot_spend_info()?
                     .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
@@ -210,7 +219,7 @@ impl Contract {
                 let message = secp256k1::Message::from(sighash);
                 let keypair = KeyPair::from_secret_key(
                     &secp,
-                    &self.hashlock.seckey.ok_or(ContractError::NoPrivKeys)?,
+                    &self.hashlock.ok_or(ContractError::MissingHashlock)?.seckey.ok_or(ContractError::NoPrivKeys)?,
                 );
                 let signature = secp.sign_schnorr(&message, &keypair);
                 let final_sig = schnorr::SchnorrSig {
@@ -221,6 +230,7 @@ impl Contract {
                     final_sig.serialize(),
                     Vec::from(
                         self.hashlock
+                            .ok_or(ContractError::MissingHashlock)?
                             .preimage
                             .as_ref()
                             .ok_or(ContractError::PreimageMissing)?
@@ -267,6 +277,22 @@ impl Contract {
         }
 
         Ok(tx)
+    }
+}
+
+// Offer and pubkey for the
+impl From<(Offer, XOnlyPublicKey)> for Contract {
+    fn from(value: (Offer, XOnlyPublicKey)) -> Self {
+        let mut escrow_keys = HashMap::new();
+        escrow_keys.insert(Role::Participant, EscrowKeys::from(value.0.participant_escrow_pubkey));
+        let hashlock = Some((value.0.hashlock, value.1).into());
+        let timelock = (value.0.participant_timelock, value.0.initiator_escrow_pubkey.x_only_public_key().0).into();
+        Contract {
+            escrow_keys,
+            hashlock,
+            timelock,
+            utxo: None,
+        }
     }
 }
 

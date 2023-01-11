@@ -3,14 +3,14 @@ use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use bitcoin::{Script, XOnlyPublicKey};
+use bitcoin::{KeyPair, Script, XOnlyPublicKey};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub(crate) struct EscrowKeys {
-    pubkey: Option<PublicKey>,
-    seckey: Option<SecretKey>,
+    pub(crate) pubkey: PublicKey,
+    pub(crate) seckey: Option<SecretKey>,
 }
 
 impl EscrowKeys {
@@ -18,7 +18,7 @@ impl EscrowKeys {
         let secp = Secp256k1::new();
         let (seckey, pubkey) = secp.generate_keypair(&mut rand::thread_rng());
         Self {
-            pubkey: Some(pubkey),
+            pubkey: pubkey,
             seckey: Some(seckey),
         }
     }
@@ -27,7 +27,7 @@ impl EscrowKeys {
         let secp = Secp256k1::new();
         Some(
             other
-                .pubkey?
+                .pubkey
                 .mul_tweak(&secp, &Scalar::from(self.seckey?))
                 .ok()?
                 .x_only_public_key()
@@ -44,16 +44,16 @@ impl From<PublicKey> for EscrowKeys {
     fn from(value: PublicKey) -> Self {
         Self {
             seckey: None,
-            pubkey: Some(value),
+            pubkey: value,
         }
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub(crate) struct Hashlock {
-    hash: String,
+    pub(crate) hash: String,
     pub(crate) preimage: Option<String>,
-    pubkey: XOnlyPublicKey,
+    pub(crate) pubkey: XOnlyPublicKey,
     pub(crate) seckey: Option<SecretKey>,
 }
 
@@ -96,7 +96,7 @@ impl From<(String, XOnlyPublicKey)> for Hashlock {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub(crate) struct Timelock {
     pub(crate) nblocks: u16,
     pubkey: XOnlyPublicKey,
@@ -104,13 +104,12 @@ pub(crate) struct Timelock {
 }
 
 impl Timelock {
-    pub(crate) fn new(nblocks: u16) -> Self {
-        let secp = Secp256k1::new();
-        let (seckey, pubkey) = secp.generate_keypair(&mut rand::thread_rng());
+    pub(crate) fn new(nblocks: u16, keypair: KeyPair) -> Self {
+
         Self {
             nblocks,
-            pubkey: pubkey.x_only_public_key().0,
-            seckey: Some(seckey),
+            pubkey: keypair.x_only_public_key().0,
+            seckey: Some(keypair.secret_key()),
         }
     }
     pub(crate) fn build_script(&self) -> Script {
@@ -121,5 +120,15 @@ impl Timelock {
             .push_x_only_key(&self.pubkey)
             .push_opcode(OP_CHECKSIG)
             .into_script()
+    }
+}
+
+impl From<(u16, XOnlyPublicKey)> for Timelock {
+    fn from(value: (u16, XOnlyPublicKey)) -> Self {
+        Timelock {
+            nblocks: value.0,
+            pubkey: value.1,
+            seckey: None,
+        }
     }
 }

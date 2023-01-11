@@ -2,7 +2,7 @@ use bitcoin::{Amount, OutPoint, Script, TxOut};
 use bitcoincore_rpc::json::ListUnspentResultEntry;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Utxo {
     pub txid: bitcoin::Txid,
     pub vout: u32,
