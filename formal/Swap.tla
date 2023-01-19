@@ -246,9 +246,9 @@ TerminalAction == PartnerFinished \/ ProposerFinished
  *)
 
  PartnerCancel == /\ dm = "cancel_swap"
-                 /\ partner_state = "offered"
-                 /\ partner_state' = "cancelled"
-                 /\ UNCHANGED << proposer_state, dm, escrows, timelocks >>
+                  /\ partner_state = "offered"
+                  /\ partner_state' = "cancelled"
+                  /\ UNCHANGED << proposer_state, dm, escrows, timelocks >>
 
 (*
  * Blockchain advancing
@@ -318,6 +318,7 @@ Next == \/ BlockConfirmation
         \/ HashlockAction
         \/ KeypathSpendAction
         \/ TerminalAction
+        \/ PartnerCancel
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
