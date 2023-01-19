@@ -3,7 +3,6 @@ This is a formal specification for the Swap protocol used in Blink.
 There are two participants in a swap. The participant that initiates the protocol 
 is called the `proposer`. The second participant is called the `partner`.
 
-
 -------------------------------- MODULE Swap --------------------------------
 \* internal state enum for each participant
 VARIABLES proposer_state, partner_state
@@ -26,9 +25,12 @@ timelocks == << proposer_timelock_mature, partner_timelock_mature >>
 vars == << proposer_state, partner_state, dm, escrows, timelocks >>
 
 swap_states == {"init", "proposed", "offered", "bootstrapped", "pendinglock", 
-                "deposited", "preimagerevealed", "seckeyrevealed", "closable", 
-                "closedsuccess", "closedhashlock", "closedtimelock", "refundspend", 
-                "hashlockspend", "timedout", "cancelled"}
+                "deposited", "preimagerevealed", "seckeyrevealed", "closable", "closed",
+                "closedtimelock", "cancelled"}
+
+TypeInvariant == /\ proposer_state \in swap_states
+                 /\ partner_state \in swap_states
+
 
 Init == /\ proposer_state = "init"
         /\ partner_state = "init"
@@ -68,7 +70,6 @@ OfferSwap == /\ proposer_state = "proposed"
              /\ dm'            = "partner_setup"
              /\ UNCHANGED  << proposer_state, escrows, timelocks >>
 
-
 RespondToOffer == /\ proposer_state = "proposed"
                   /\ dm             = "partner_setup"
                   /\ partner_state  = "offered"
@@ -100,8 +101,6 @@ PartnerDeposit == /\ partner_state = "pendinglock"
                   /\ partner_state' = "deposited"
                   /\ UNCHANGED << proposer_state, dm, proposer_escrow, timelocks >>
 
-
-
 ProposerDeposit == /\ proposer_state = "pendinglock"
                    /\ partner_escrow = "confirmed_deposit"
                    /\ proposer_state' = "deposited"
@@ -111,17 +110,20 @@ ProposerDeposit == /\ proposer_state = "pendinglock"
 RevealPreimage == /\ partner_state = "deposited"
                   /\ proposer_escrow = "confirmed_deposit"
                   /\ partner_escrow = "confirmed_deposit"
+                  /\ TimelocksOk
                   /\ dm' = "preimage"
                   /\ partner_state' = "preimagerevealed"
                   /\ UNCHANGED << proposer_state, escrows, timelocks >>
                   
 ReceivePreimage == /\ dm = "preimage"
+                   /\ proposer_state \notin {"closable", "closed", "closedtimelock"}
                    /\ proposer_state' = "preimagerevealed"
                    /\ UNCHANGED << partner_state, escrows, dm, timelocks >>
 
 SendProposerSeckey ==  /\ proposer_state = "preimagerevealed"
                        /\ proposer_escrow = "confirmed_deposit"
                        /\ partner_escrow = "confirmed_deposit"
+                       /\ TimelocksOk
                        /\ dm' = "proposer_seckey"
                        /\ proposer_state' = "seckeyrevealed"
                        /\ UNCHANGED  << partner_state, escrows, timelocks >>
@@ -129,9 +131,30 @@ SendProposerSeckey ==  /\ proposer_state = "preimagerevealed"
 ReceiveProposerSecKey == /\ dm = "proposer_seckey"
                          /\ proposer_escrow = "confirmed_deposit"
                          /\ partner_escrow = "confirmed_deposit"
+                         /\ TimelocksOk
                          /\ partner_state' = "seckeyrevealed"
                          /\ dm' = "partner_seckey"
                          /\ UNCHANGED  << proposer_state, escrows, timelocks >>
+
+ReceivePartnerSecKey == /\ dm = "partner_seckey"
+                        /\ partner_escrow = "confirmed_deposit"
+                        /\ TimelocksOk
+                        /\ proposer_state' = "closable"
+                        /\ UNCHANGED << partner_state, dm, escrows, timelocks >>
+
+ProtocolAction == \/ ProposeSwap
+                  \/ OfferSwap
+                  \/ RespondToOffer
+                  \/ PartnerBootstrap
+                  \/ PartnerConfirmAddress
+                  \/ ProposerConfirmAddress
+                  \/ PartnerDeposit
+                  \/ ProposerDeposit
+                  \/ RevealPreimage
+                  \/ ReceivePreimage
+                  \/ SendProposerSeckey
+                  \/ ReceiveProposerSecKey
+                  \/ ReceivePartnerSecKey
 
 (*
  * Spending from escrows
@@ -157,11 +180,66 @@ PartnerSpendRefund == /\ partner_escrow = "confirmed_deposit"
 PartnerReceiveRefund ==  /\ partner_escrow = "confirmed_refund"
                          /\ partner_state' = "closedtimelock"
                          /\ UNCHANGED << proposer_state, dm, escrows, timelocks >>
+                         
+RefundAction == \/ ProposerSpendRefund
+                \/ ProposerReceiveRefund                 
+                \/ PartnerSpendRefund
+                \/ PartnerReceiveRefund
 
 \* Once a participant knows the hash preimage, they can spend via the hashlock
 \* It's better for privacy to wait until they can do a keyspend, but its possible
 \* and makes sure that everyone gets paid if the protocol stops there.
+\* the Partner starts off with the preimage, so they can spend as soon as funds
+\* are locked.
+PartnerSpendHashlock == /\ proposer_escrow = "confirmed_deposit"
+                        /\ TimelocksOk
+                        \* The partner spends the proposer escrow
+                        /\ proposer_escrow' = "pending_spend"
+                        \* TODO: change state for partner?
+                        /\ UNCHANGED << partner_escrow, participant_states, timelocks, dm >>
 
+ProposerObservesPreimageOnchain == /\ proposer_escrow = "confirmed_spend"
+                                   /\ proposer_state # "closable"
+                                   /\ proposer_state' = "preimagerevealed"
+                                   /\ UNCHANGED << partner_state, escrows, timelocks, dm >>
+
+\* Proposer can spend from the hashlock as soon as the preimage is revealed, either
+\* through the protocol or because they saw the Partner spend with it onchain.
+\* The Proposer spends the partner escrow.
+ProposerSpendHashLock == /\ partner_escrow = "confirmed_deposit"
+                         /\ TimelocksOk
+                         /\ proposer_state = "preimagerevealed"
+                         /\ partner_escrow' = "pending_spend"
+                         /\ UNCHANGED << proposer_escrow, participant_states, timelocks, dm >>
+
+HashlockAction == PartnerSpendHashlock \/ ProposerObservesPreimageOnchain \/ ProposerSpendHashLock
+
+\* The best case is where the participants spend via the keypath.
+PartnerSpendKeypath == /\ proposer_escrow = "confirmed_deposit"
+                       /\ TimelocksOk
+                       /\ partner_state = "seckeyrevealed"
+                       /\ proposer_escrow' = "pending_spend"
+                       /\ UNCHANGED << partner_escrow, participant_states, timelocks, dm >>
+
+ProposerSpendKeypath == /\ partner_escrow = "confirmed_deposit"
+                        /\ TimelocksOk
+                        /\ proposer_state = "closable"
+                        /\ partner_escrow' = "pending_spend"
+                        /\ UNCHANGED << proposer_escrow, participant_states, timelocks, dm >>
+
+KeypathSpendAction == PartnerSpendKeypath \/ ProposerSpendKeypath
+
+\* Partner spends the proposer escrow
+PartnerFinished == /\ proposer_escrow = "confirmed_spend"
+                   /\ partner_state' = "closed"
+                   /\ UNCHANGED << proposer_state, escrows, timelocks, dm >>
+
+\* Proposer spends the proposer escrow
+ProposerFinished == /\ partner_escrow = "confirmed_spend"
+                    /\ proposer_state' = "closed"
+                    /\ UNCHANGED << partner_state, escrows, timelocks, dm >>
+
+TerminalAction == PartnerFinished \/ ProposerFinished
 
 (*
  * Cancellation
@@ -175,20 +253,20 @@ PartnerReceiveRefund ==  /\ partner_escrow = "confirmed_refund"
 (*
  * Blockchain advancing
  *)
-BlockConfirmed ==   \/  /\  \/  /\ partner_escrow = "pending_deposit"
-                                /\ partner_escrow' = "confirmed_deposit"
-                            \/  /\ partner_escrow = "pending_refund"
-                                /\ partner_escrow' = "confirmed_refund"
-                            \/  /\ partner_escrow = "pending_spend"
-                                /\ partner_escrow' = "confirmed_spend"
-                        /\ UNCHANGED << participant_states, dm, proposer_escrow, timelocks >>
-                    \/  /\  \/  /\ proposer_escrow = "pending_deposit"
-                                /\ proposer_escrow' = "confirmed_deposit"
-                            \/  /\ proposer_escrow = "pending_refund"
-                                /\ proposer_escrow' = "confirmed_refund"
-                            \/  /\ proposer_escrow = "pending_spend"
-                                /\ proposer_escrow' = "confirmed_spend"
-                        /\ UNCHANGED << participant_states, dm, partner_escrow, timelocks >>
+BlockConfirmation == \/  /\  \/  /\ partner_escrow  = "pending_deposit"
+                                 /\ partner_escrow' = "confirmed_deposit"
+                             \/  /\ partner_escrow  = "pending_refund"
+                                 /\ partner_escrow' = "confirmed_refund"
+                             \/  /\ partner_escrow  = "pending_spend"
+                                 /\ partner_escrow' = "confirmed_spend"
+                         /\ UNCHANGED << participant_states, dm, proposer_escrow, timelocks >>
+                     \/  /\  \/  /\ proposer_escrow  = "pending_deposit"
+                                 /\ proposer_escrow' = "confirmed_deposit"
+                             \/  /\ proposer_escrow  = "pending_refund"
+                                 /\ proposer_escrow' = "confirmed_refund"
+                             \/  /\ proposer_escrow  = "pending_spend"
+                                 /\ proposer_escrow' = "confirmed_spend"
+                         /\ UNCHANGED << participant_states, dm, partner_escrow, timelocks >>
 
 \* Some amount of time after an escrow has been confirmed, the timelock 
 \* will mature. 
@@ -205,6 +283,7 @@ PartnerTimelockMature == /\ proposer_timelock_mature = TRUE
                          /\ partner_timelock_mature' = TRUE
                          /\ UNCHANGED << participant_states, dm, escrows, proposer_timelock_mature >>
 
+TimelockMaturation == ProposerTimelockMature \/ PartnerTimelockMature
 
 (*
  * Invariants and Temporal Properties
@@ -229,30 +308,16 @@ NobodyGetsBothEscrows == \/ ProposerRefund ~> PartnerRefund
 
 \* Once funds have been deposited, they eventually get paid out. 
 \* Once an escrow has been paid out, it doesn't get re-spent
-EscrowPaymentTerminal == /\ proposer_state = "deposited" ~> (<>[] PartnerPaid) \/ (<>[] ProposerRefund)
-                         /\ partner_state = "desposited" ~> (<>[] ProposerPaid) \/ (<>[] PartnerRefund)
+EscrowPaymentTerminal == /\ proposer_state = "deposited" ~> ( (<>[] PartnerPaid) \/ (<>[] ProposerRefund) )
+                         /\ partner_state = "deposited" ~> ( (<>[] ProposerPaid) \/ (<>[] PartnerRefund) )
 
-
-Next == \/ BlockConfirmed
-        \/ ProposeSwap
-        \/ OfferSwap
-        \/ RespondToOffer
-        \/ PartnerCancel
-        \/ PartnerBootstrap
-        \/ PartnerConfirmAddress
-        \/ ProposerConfirmAddress
-        \/ PartnerDeposit
-        \/ ProposerDeposit
-        \/ RevealPreimage
-        \/ ReceivePreimage
-        \/ SendProposerSeckey
-        \/ ReceiveProposerSecKey
-        \/ ProposerSpendRefund
-        \/ ProposerReceiveRefund
-        \/ PartnerSpendRefund
-        \/ PartnerReceiveRefund
-        \/ ProposerTimelockMature
-        \/ PartnerTimelockMature
+Next == \/ BlockConfirmation
+        \/ ProtocolAction
+        \/ RefundAction
+        \/ TimelockMaturation
+        \/ HashlockAction
+        \/ KeypathSpendAction
+        \/ TerminalAction
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
@@ -262,3 +327,4 @@ Assumptions that we make in this spec:
 1. Participants try to make forward progress for themselves. We don't model the case where someone just leaves their money behind.
 2. Transactions submitted to the Bitcoin are eventually mined. We assume that participant software will rebroadcast purged transactions. 
 3. We assume that participants can get their transactions into the next block through fee selection or fee bumping
+4. We assume that both participants watch the chain and see when transactions happen.
