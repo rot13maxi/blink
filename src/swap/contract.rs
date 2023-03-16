@@ -1,407 +1,213 @@
-use bitcoin::blockdata::opcodes::all::{OP_CHECKSIG, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
+use std::collections::HashMap;
+
+use bitcoin::blockdata::opcodes::all::{OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256};
 use bitcoin::blockdata::script;
 use bitcoin::hashes::hex::ToHex;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::psbt::serialize::Serialize;
 use bitcoin::psbt::Prevouts;
-use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::{Parity, Scalar, Secp256k1, SecretKey};
 use bitcoin::util::sighash::SighashCache;
-use bitcoin::util::taproot::{LeafVersion, TapLeafHash, TaprootBuilder, TaprootSpendInfo};
-use bitcoin::{
-    schnorr, secp256k1, Address, KeyPair, Network, OutPoint, PackedLockTime,
-    SchnorrSighashType, Script, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
+use bitcoin::util::taproot::{
+    LeafVersion, TapLeafHash, TaprootBuilder, TaprootBuilderError, TaprootSpendInfo,
 };
+use bitcoin::{
+    schnorr, secp256k1, Address, KeyPair, Network, OutPoint, PackedLockTime, SchnorrSighashType,
+    Script, Sequence, Transaction, TxIn, TxOut, Witness, XOnlyPublicKey,
+};
+use rand::Rng;
 use serde::Deserialize;
-use serde_json::json;
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
-use uuid::Uuid;
+use thiserror::Error;
 
-use crate::swap::contract::ContractState::{Init, Proposed};
+use crate::swap::components::{EscrowKeys, Hashlock, Timelock};
+use crate::swap::message::Offer;
+use crate::swap::role::Role;
+use crate::swap::role::Role::{Initiator, Participant};
 use crate::swap::utxo::Utxo;
 
-const DEFAULT_TIMELOCK: u16 = 144;
-const REQUIRED_CONFIRMATIONS: u32 = 1;
+const DEFAULT_TIMELOCK: u16 = 144; // blocks
+const REQUIRED_CONFIRMATIONS: u32 = 1; // blocks
 
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct Proposal {
-    id: String,
-    network: Network,
-    maker_pubkey: PublicKey,
-    taker_pubkey: PublicKey,
-    hashlock: String,
-    maker_timelock: u16,
-    amount: u64,
-    // TODO: contract expiry?
+#[derive(Error, Debug)]
+pub enum ContractError {
+    #[error("escrow key for `{0}` not available")]
+    MissingKeys(Role),
+    #[error("no private keys available for escrow")]
+    NoPrivKeys,
+    #[error("could not construct taptree: `{0}`")]
+    TapTreeError(TaprootBuilderError),
+    #[error("could not finalize taproot info`")]
+    TaprootFinalizationError,
+    #[error("could not construct transaction: `{0}")]
+    TransactionConstructionError(String),
+    #[error("no UTXO found for contract")]
+    NoUtxoError,
+    #[error("could not construct sighash: `{0}`")]
+    ScriptHashError(String),
+    #[error("can't tweak private key: `{0}1")]
+    CantTweakKey(String),
+    #[error("missing hashlock preimage")]
+    PreimageMissing,
+    #[error("missing hashlock")]
+    MissingHashlock,
 }
 
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct Offer {
-    id: String,
-    maker_pubkey: PublicKey,
-    taker_pubkey: PublicKey,
-    taker_timelock: u16,
-}
+type Result<T> = std::result::Result<T, ContractError>;
 
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct FinalizeDeal {
-    id: String,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct PreimageReveal {
-    id: String,
-    preimage: String,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub(crate) struct KeyReveal {
-    id: String,
-    maker_escrow_seckey: SecretKey,
-    taker_escrow_seckey: SecretKey,
-}
-
-#[derive(Deserialize, serde::Serialize, PartialEq, Debug)]
-pub(crate) enum ContractState {
-    Init,
-    Offered,
-    Proposed,
-    Accepted,
-    Cancelled,
-    Locked,
-    HashRevealed,
-    KeyRevealed,
-    TimedOut,
-    Closed,
-}
-
-#[derive(Deserialize, serde::Serialize, Clone, PartialEq, Debug)]
-pub(crate) enum Role {
-    Maker,
-    Taker,
-}
-
-impl Role {
-    fn other(&self) -> Role {
-        match self {
-            Role::Maker => Role::Taker,
-            Role::Taker => Role::Maker,
-        }
-    }
-}
-
-impl FromStr for Role {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s == "maker" || s == "Maker" {
-            Ok(Role::Maker)
-        } else if s == "taker" || s == "Taker" {
-            Ok(Role::Taker)
-        } else {
-            Err(())
-        }
-    }
-}
-
-impl Display for Role {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Role::Maker => f.write_str("Maker"),
-            Role::Taker => f.write_str("Taker"),
-        }
-    }
-}
-
-#[derive(Deserialize, serde::Serialize, Debug)]
-struct Escrow {
-    mine: KeyPair,
-    their_pubkey: Option<PublicKey>,
-    their_privkey: Option<SecretKey>,
-    preimage: Option<String>,
-    hashlock: String,
-    timelock: Option<u16>,
-}
-
-#[derive(PartialEq, Debug)]
-enum SpendPath {
-    Unspendable,
-    Timelock,
+#[derive(PartialEq)]
+pub enum SpendPath {
+    KeyPath,
     Hashlock,
-    Keypath,
+    Timelock,
 }
 
-#[derive(Deserialize, serde::Serialize, Debug)]
+#[derive(Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Contract {
-    contract_id: String,
-    network: Network,
-    pub(crate) state: ContractState,
-    pub(crate) role: Role,
-    maker_escrow: Escrow,
-    taker_escrow: Escrow,
+    pub escrow_keys: HashMap<Role, EscrowKeys>,
+    pub hashlock: Option<Hashlock>,
+    pub timelock: Timelock,
+    pub utxo: Option<Utxo>, // someday, this will be Option<Vec<Utxo>> and then we'll REALLY be dangerous
 }
 
 impl Contract {
-    pub fn new(network: Network) -> Self {
+    pub fn new_initiator_contract(network: Network) -> Self {
         let secp = Secp256k1::new();
-        let (privkey, _) = secp.generate_keypair(&mut rand::thread_rng());
-        let preimage = b"MAKE THIS RANDOM";
-        let hashlock = sha256::Hash::hash(preimage);
-
-        let maker_escrow = Escrow {
-            mine: privkey.keypair(&secp),
-            their_pubkey: None,
-            their_privkey: None,
-            preimage: Some(preimage.to_hex()),
-            hashlock: hashlock.to_hex(),
-            timelock: Some(DEFAULT_TIMELOCK),
-        };
-        let (privkey, _) = secp.generate_keypair(&mut rand::thread_rng());
-        let taker_escrow = Escrow {
-            mine: privkey.keypair(&secp),
-            their_pubkey: None,
-            their_privkey: None,
-            preimage: Some(preimage.to_hex()),
-            hashlock: hashlock.to_hex(),
-            timelock: None,
-        };
-
+        let initiator_keys = EscrowKeys::new();
+        let mut escrow_keys = HashMap::new();
+        escrow_keys.insert(Role::Initiator, initiator_keys.clone());
+        let timelock = Timelock::new(DEFAULT_TIMELOCK, initiator_keys.seckey.unwrap().keypair(&secp));
         Self {
-            contract_id: Uuid::new_v4().to_string(),
-            network,
-            state: Init,
-            role: Role::Maker,
-            maker_escrow,
-            taker_escrow,
+            escrow_keys,
+            hashlock: None,
+            timelock,
+            utxo: None,
         }
     }
 
-    pub fn id(&self) -> String {
-        format!("{}::{}", self.contract_id, self.role)
-    }
-
-    pub fn propose(&mut self) {
-        let proposal: Proposal = self.into();
-        self.state = Proposed;
-        //TODO: publish on nostr instead of printing
-        println!("{}", json!(proposal));
-    }
-
-    pub(crate) fn accept_offer(&mut self, offer: Offer) {
-        self.maker_escrow.their_pubkey = Some(offer.maker_pubkey);
-        self.taker_escrow.their_pubkey = Some(offer.taker_pubkey);
-        self.taker_escrow.timelock = Some(offer.taker_timelock);
-        self.state = ContractState::Accepted;
-    }
-
-    pub(crate) fn finalize_deal(&mut self, _finalized_deal: FinalizeDeal) {
-        // todo: make this return a Result so I'm not panicing
-        // todo: check that this is for the right ID
-        // assert_eq!(finalized_deal.id, self.id());
-        self.state = ContractState::Accepted;
-    }
-
-    pub(crate) fn reveal_preimage(&mut self) -> Result<PreimageReveal, ()> {
-        let preimage = self.maker_escrow.preimage.as_ref().ok_or(())?;
-        self.state = ContractState::HashRevealed;
-        Ok(PreimageReveal {
-            id: self.contract_id.clone(),
-            preimage: preimage.to_string()
-        })
-    }
-
-    pub(crate) fn accept_preimage(&mut self, preimage_reveal: PreimageReveal) {
-        // todo: check that the ID is kosher
-        self.maker_escrow.preimage = Some(preimage_reveal.preimage.clone());
-        self.taker_escrow.preimage = Some(preimage_reveal.preimage.clone());
-        self.state = ContractState::HashRevealed;
-    }
-
-    pub(crate) fn reveal_seckey(&mut self) -> Result<KeyReveal, ()> {
-        self.state = ContractState::KeyRevealed;
-        Ok(KeyReveal {
-            id: self.contract_id.clone(),
-            maker_escrow_seckey: self.maker_escrow.mine.secret_key().clone(),
-            taker_escrow_seckey: self.taker_escrow.mine.secret_key().clone(),
-        })
-    }
-
-    pub(crate) fn accept_seckey(&mut self, key_reveal: KeyReveal) {
-        // todo: validate id
-        self.maker_escrow.their_privkey = Some(key_reveal.maker_escrow_seckey);
-        self.taker_escrow.their_privkey = Some(key_reveal.taker_escrow_seckey);
-    }
-
-    fn calculate_escrow_pubkey(&self, role: Role) -> (XOnlyPublicKey, Parity) {
-        let secp = Secp256k1::new();
-        let escrow = match role {
-            Role::Maker => &self.maker_escrow,
-            Role::Taker => &self.taker_escrow
+    pub fn create_hashlock(&mut self, hash: String, keys: EscrowKeys) {
+        let hashlock = Hashlock {
+            hash,
+            preimage: None,
+            pubkey: keys.pubkey.x_only_public_key().0,
+            seckey: keys.seckey,
         };
-        escrow.their_pubkey.unwrap().mul_tweak(&secp, &Scalar::from(escrow.mine.secret_key())).unwrap().x_only_public_key()
+        self.hashlock = Some(hashlock);
     }
 
-
-    fn calculate_escrow_privkey(&self, escrow: &Escrow) -> SecretKey {
-        escrow.their_privkey.unwrap().mul_tweak(&Scalar::from(escrow.mine.secret_key())).unwrap()
-    }
-
-    fn build_taproot_spend_info(&self, role: Role) -> TaprootSpendInfo {
-        let secp = Secp256k1::new();
-
-        let escrow = match role {
-            Role::Maker => &self.maker_escrow,
-            Role::Taker => &self.taker_escrow,
-        };
-
-        let timelock_blocks = escrow.timelock.unwrap();
-        let hashlock = escrow.hashlock.clone();
-        let (timelock_key, hashlock_key) = if role == self.role {
-            (escrow.mine.x_only_public_key().0, escrow.their_pubkey.unwrap().x_only_public_key().0)
+    fn calculate_shared_pubkey(&self) -> Result<XOnlyPublicKey> {
+        let initiator_escrow = self
+            .escrow_keys
+            .get(&Initiator)
+            .ok_or(ContractError::MissingKeys(Initiator))?;
+        let participant_escrow = self
+            .escrow_keys
+            .get(&Participant)
+            .ok_or(ContractError::MissingKeys(Participant))?;
+        if let Some(pubkey) = initiator_escrow.calculate_shared_pubkey(participant_escrow) {
+            Ok(pubkey)
+        } else if let Some(pubkey) = participant_escrow.calculate_shared_pubkey(initiator_escrow) {
+            Ok(pubkey)
         } else {
-            (escrow.their_pubkey.unwrap().x_only_public_key().0, escrow.mine.x_only_public_key().0)
-        };
-
-        TaprootBuilder::new()
-            .add_leaf(
-                1u8,
-                build_hashlock_script(hashlock.as_bytes(), &hashlock_key),
-            )
-            .unwrap()
-            .add_leaf(
-                1u8,
-                build_timelock_script(timelock_blocks as i64, &timelock_key),
-            )
-            .unwrap()
-            .finalize(&secp, self.calculate_escrow_pubkey(role).0)
-            .unwrap()
+            Err(ContractError::NoPrivKeys)
+        }
     }
 
-    pub(crate) fn get_address(&self, role: Role) -> Address {
-        Address::p2tr_tweaked(
-            self.build_taproot_spend_info(role).output_key(),
-            self.network,
-        )
+    fn calculate_shared_seckey(&self) -> Result<SecretKey> {
+        let initiator_seckey = self
+            .escrow_keys
+            .get(&Initiator)
+            .ok_or(ContractError::MissingKeys(Initiator))?;
+        let participant_escrow = self
+            .escrow_keys
+            .get(&Participant)
+            .ok_or(ContractError::MissingKeys(Participant))?;
+        initiator_seckey
+            .calculate_shared_seckey(participant_escrow)
+            .ok_or(ContractError::NoPrivKeys)
     }
 
-    fn get_spend_path(&self, confirmations: u32) -> SpendPath {
-        if confirmations < REQUIRED_CONFIRMATIONS {
-            return SpendPath::Unspendable;
-        }
-        // their escrow for hashlock and keyspend paths, my escrow for timelock
-        let escrow = match self.role {
-            Role::Maker => &self.maker_escrow,
-            Role::Taker => &self.taker_escrow,
-        };
-        if escrow.their_privkey.is_some() {
-            return SpendPath::Keypath;
-        }
-        if escrow.preimage.is_some() {
-            return SpendPath::Hashlock;
-        }
-        let escrow = match self.role {
-            Role::Maker => &self.taker_escrow,
-            Role::Taker => &self.maker_escrow,
-        };
-        if let Some(timelock) = escrow.timelock {
-            if timelock <= confirmations as u16 {
-                return SpendPath::Timelock;
-            }
-        }
-        SpendPath::Unspendable
+    fn build_taproot_spend_info(&self) -> Result<TaprootSpendInfo> {
+        let secp = Secp256k1::new();
+        Ok(TaprootBuilder::new()
+            .add_leaf(1u8, self.hashlock.ok_or(ContractError::MissingHashlock)?.build_script())
+            .map_err(|err| ContractError::TapTreeError(err))?
+            .add_leaf(1u8, self.timelock.build_script())
+            .map_err(|err| ContractError::TapTreeError(err))?
+            .finalize(&secp, self.calculate_shared_pubkey()?)
+            .map_err(|_| ContractError::TaprootFinalizationError)?)
+    }
+
+    pub(crate) fn get_address(&self, network: Network) -> Result<Address> {
+        Ok(Address::p2tr_tweaked(
+            self.build_taproot_spend_info()?.output_key(),
+            network,
+        ))
     }
 
     /// Get a signed, ready-to-send TX that spends the contract
     pub fn get_spending_tx(
         &self,
-        utxo: &Utxo,
-        address: Address,
+        spend_path: SpendPath,
+        destination: Address,
         fee_rate: Option<u64>,
-    ) -> Result<Transaction, ()> {
-        let spend_path = self.get_spend_path(utxo.confirmations);
-        // my escrow for timelock, their escrow otherwise
-        let escrow = if spend_path == SpendPath::Timelock {
-            match self.role {
-                Role::Maker => &self.maker_escrow,
-                Role::Taker => &self.taker_escrow,
-            }
-        } else {
-            match self.role {
-                Role::Maker => &self.taker_escrow,
-                Role::Taker => &self.maker_escrow,
-            }
-        };
-        let prev_outpoint = OutPoint {
-            txid: utxo.txid,
-            vout: utxo.vout,
-        };
-        let prev_txout = TxOut {
-            value: utxo.amount.to_sat(),
-            script_pubkey: utxo.script_pub_key.clone(),
-        };
-        let vbytes = 600; // totally just made up number. todo: calculate this
-        let fee = vbytes * fee_rate.unwrap_or(1);
-        let mut tx = Transaction {
+    ) -> Result<Transaction> {
+        // TODO: actually calculate transaction size so we can do better fee calculation
+        // Just picking a number for now. will probably be overpaying in most cases
+        let tx_vbytes = 600;
+        let fee = tx_vbytes * fee_rate.unwrap_or(1);
+        let mut tx: Transaction = Transaction {
             version: 2,
             lock_time: PackedLockTime::ZERO,
             input: vec![TxIn {
-                previous_output: prev_outpoint,
+                previous_output: self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.into(),
+                script_sig: script::Builder::new().into_script(),
                 sequence: if spend_path == SpendPath::Timelock {
-                    Sequence::from_height(escrow.timelock.unwrap())
+                    Sequence::from_height(self.timelock.nblocks)
                 } else {
                     Sequence::MAX
                 },
-                script_sig: script::Builder::new().into_script(),
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: utxo.amount.to_sat() - fee,
-                script_pubkey: address.script_pubkey(),
+                value: self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.amount - fee,
+                script_pubkey: destination.script_pubkey(),
             }],
         };
-        let prevout = vec![prev_txout];
+        let prevout: Vec<TxOut> =
+            vec![self.utxo.as_ref().ok_or(ContractError::NoUtxoError)?.into()];
         let secp = Secp256k1::new();
         let mut sighash_cache = SighashCache::new(&tx);
-        // build and push tx witness based on what kind of tx we're doing
-        match spend_path {
-            SpendPath::Unspendable => return Err(()),
-            SpendPath::Timelock => {
-                let timelock_script = build_timelock_script(
-                    escrow.timelock.unwrap() as i64,
-                    &escrow.mine.x_only_public_key().0,
-                );
-                let control_block = self
-                    .build_taproot_spend_info(self.role.clone())
-                    .control_block(&(timelock_script.clone(), LeafVersion::TapScript))
-                    .unwrap();
+        let witness = match spend_path {
+            SpendPath::KeyPath => {
                 let sighash = sighash_cache
-                    .taproot_script_spend_signature_hash(
+                    .taproot_key_spend_signature_hash(
                         0,
                         &Prevouts::All(&prevout),
-                        TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript),
                         SchnorrSighashType::Default,
                     )
-                    .unwrap();
+                    .map_err(|e| ContractError::ScriptHashError(e.to_string()))?;
                 let message = secp256k1::Message::from(sighash);
-                let signature = secp.sign_schnorr(&message, &escrow.mine);
+                let tweaked_keypair = self
+                    .calculate_shared_seckey()?
+                    .keypair(&secp)
+                    .add_xonly_tweak(
+                        &secp,
+                        &self.build_taproot_spend_info()?.tap_tweak().to_scalar(),
+                    )
+                    .map_err(|err| ContractError::CantTweakKey(err.to_string()))?;
+                let signature = secp.sign_schnorr(&message, &tweaked_keypair);
                 let final_sig = schnorr::SchnorrSig {
                     sig: signature,
                     hash_ty: SchnorrSighashType::Default,
                 };
-                tx.input[0].witness.push(final_sig.serialize());
-                tx.input[0].witness.push(timelock_script.serialize());
-                tx.input[0].witness.push(control_block.serialize());
+                vec![final_sig.serialize()]
             }
             SpendPath::Hashlock => {
-                let hashlock_script = build_hashlock_script(
-                    escrow.hashlock.as_bytes(),
-                    &escrow.mine.x_only_public_key().0,
-                );
+                let hashlock_script = self.hashlock.ok_or(ContractError::MissingHashlock)?.build_script();
                 let control_block = self
-                    .build_taproot_spend_info(self.role.other().clone())
+                    .build_taproot_spend_info()?
                     .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
-                    .unwrap();
+                    .ok_or(ContractError::TaprootFinalizationError)?;
                 let sighash = sighash_cache
                     .taproot_script_spend_signature_hash(
                         0,
@@ -409,208 +215,86 @@ impl Contract {
                         TapLeafHash::from_script(&hashlock_script, LeafVersion::TapScript),
                         SchnorrSighashType::Default,
                     )
-                    .unwrap();
+                    .map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
                 let message = secp256k1::Message::from(sighash);
-                let signature = secp.sign_schnorr(&message, &escrow.mine);
+                let keypair = KeyPair::from_secret_key(
+                    &secp,
+                    &self.hashlock.ok_or(ContractError::MissingHashlock)?.seckey.ok_or(ContractError::NoPrivKeys)?,
+                );
+                let signature = secp.sign_schnorr(&message, &keypair);
                 let final_sig = schnorr::SchnorrSig {
                     sig: signature,
                     hash_ty: SchnorrSighashType::Default,
                 };
-                tx.input[0].witness.push(final_sig.serialize());
-                tx.input[0].witness.push(escrow.preimage.clone().unwrap());
-                tx.input[0].witness.push(hashlock_script.serialize());
-                tx.input[0].witness.push(control_block.serialize());
+                vec![
+                    final_sig.serialize(),
+                    Vec::from(
+                        self.hashlock
+                            .ok_or(ContractError::MissingHashlock)?
+                            .preimage
+                            .as_ref()
+                            .ok_or(ContractError::PreimageMissing)?
+                            .clone()
+                            .as_bytes(),
+                    ),
+                    hashlock_script.serialize(),
+                    control_block.serialize(),
+                ]
             }
-            SpendPath::Keypath => {
+            SpendPath::Timelock => {
+                let timelock_script = self.timelock.build_script();
+                let control_block = self
+                    .build_taproot_spend_info()?
+                    .control_block(&(timelock_script.clone(), LeafVersion::TapScript))
+                    .ok_or(ContractError::TaprootFinalizationError)?;
                 let sighash = sighash_cache
-                    .taproot_key_spend_signature_hash(
+                    .taproot_script_spend_signature_hash(
                         0,
                         &Prevouts::All(&prevout),
+                        TapLeafHash::from_script(&timelock_script, LeafVersion::TapScript),
                         SchnorrSighashType::Default,
                     )
-                    .unwrap();
+                    .map_err(|err| ContractError::ScriptHashError(err.to_string()))?;
                 let message = secp256k1::Message::from(sighash);
-                let tweaked_keypair = self.calculate_escrow_privkey(&escrow)
-                    .keypair(&secp)
-                    .add_xonly_tweak(
-                        &secp,
-                        &self
-                            .build_taproot_spend_info(self.role.clone())
-                            .tap_tweak()
-                            .to_scalar(),
-                    )
-                    .unwrap();
-                let signature = secp.sign_schnorr(&message, &tweaked_keypair);
+                let keypair = KeyPair::from_secret_key(
+                    &secp,
+                    &self.timelock.seckey.ok_or(ContractError::NoPrivKeys)?,
+                );
+                let signature = secp.sign_schnorr(&message, &keypair);
                 let final_sig = schnorr::SchnorrSig {
                     sig: signature,
                     hash_ty: SchnorrSighashType::Default,
                 };
-                tx.input[0].witness.push(final_sig.serialize());
+                vec![
+                    final_sig.serialize(),
+                    timelock_script.serialize(),
+                    control_block.serialize(),
+                ]
             }
         };
+        for item in witness {
+            tx.input[0].witness.push(item);
+        }
 
         Ok(tx)
     }
 }
 
-impl From<&mut Contract> for Proposal {
-    fn from(value: &mut Contract) -> Proposal {
-        Proposal {
-            id: value.contract_id.clone(),
-            network: value.network,
-            maker_pubkey: value.maker_escrow.mine.public_key().clone(),
-            taker_pubkey: value.taker_escrow.mine.public_key().clone(),
-            hashlock: value.maker_escrow.hashlock.clone(),
-            maker_timelock: value.maker_escrow.timelock.unwrap(),
-            amount: Default::default(),
-        }
-    }
-}
-
-impl From<&mut Contract> for Offer {
-    fn from(value: &mut Contract) -> Self {
-        Offer {
-            id: value.contract_id.clone(),
-            maker_pubkey: value.maker_escrow.mine.public_key().clone(),
-            taker_pubkey: value.taker_escrow.mine.public_key().clone(),
-            taker_timelock: value.taker_escrow.timelock.unwrap(),
-        }
-    }
-}
-
-impl From<&mut Contract> for FinalizeDeal {
-    fn from(value: &mut Contract) -> Self {
-        FinalizeDeal {
-            id: value.contract_id.clone(),
-        }
-    }
-}
-
-impl From<Proposal> for Contract {
-    fn from(value: Proposal) -> Self {
-        let secp = Secp256k1::new();
-        let (privkey, _) = secp.generate_keypair(&mut rand::thread_rng());
-        let maker_escrow = Escrow {
-            mine: privkey.keypair(&secp),
-            their_pubkey: Some(value.maker_pubkey),
-            their_privkey: None,
-            preimage: None,
-            hashlock: value.hashlock.clone(),
-            timelock: Some(value.maker_timelock),
-        };
-
-        let (privkey, _) = secp.generate_keypair(&mut rand::thread_rng());
-        let taker_escrow = Escrow {
-            mine: privkey.keypair(&secp),
-            their_pubkey: Some(value.taker_pubkey),
-            their_privkey: None,
-            preimage: None,
-            hashlock: value.hashlock,
-            timelock: Some(value.maker_timelock - 10), // taker should have a shorter timelock because they're at disadvantage for the hashlock
-        };
-
+// Offer and pubkey for the
+impl From<(Offer, XOnlyPublicKey)> for Contract {
+    fn from(value: (Offer, XOnlyPublicKey)) -> Self {
+        let mut escrow_keys = HashMap::new();
+        escrow_keys.insert(Role::Participant, EscrowKeys::from(value.0.participant_escrow_pubkey));
+        let hashlock = Some((value.0.hashlock, value.1).into());
+        let timelock = (value.0.participant_timelock, value.0.initiator_escrow_pubkey.x_only_public_key().0).into();
         Contract {
-            contract_id: value.id,
-            network: value.network,
-            state: Proposed,
-            role: Role::Taker,
-            maker_escrow,
-            taker_escrow,
+            escrow_keys,
+            hashlock,
+            timelock,
+            utxo: None,
         }
     }
-}
-
-fn build_timelock_script(nblocks: i64, pubkey: &XOnlyPublicKey) -> Script {
-    script::Builder::new()
-        .push_int(nblocks)
-        .push_opcode(OP_CSV)
-        .push_opcode(OP_DROP)
-        .push_x_only_key(pubkey)
-        .push_opcode(OP_CHECKSIG)
-        .into_script()
-}
-
-fn build_hashlock_script(hash: &[u8], pubkey: &XOnlyPublicKey) -> Script {
-    script::Builder::new()
-        .push_opcode(OP_SHA256)
-        .push_slice(hash)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_x_only_key(pubkey)
-        .push_opcode(OP_CHECKSIG)
-        .into_script()
 }
 
 #[cfg(test)]
-mod tests {
-    use bitcoin::Network;
-
-    use crate::swap::contract::{Contract, ContractState, FinalizeDeal, Offer, Proposal, Role, SpendPath};
-
-    #[test]
-    fn test_contract_construction() {
-        let network = Network::Regtest;
-        let mut maker = Contract::new(network);
-        let proposal = Proposal::from(&mut maker);
-        maker.propose();
-        // now we'd serialize it and send it over nostr
-        let mut taker = Contract::from(proposal);
-        assert_eq!(maker.state, ContractState::Proposed);
-        assert_eq!(taker.state, ContractState::Proposed);
-
-        let offer = Offer::from(&mut taker);
-        // send that over nostr
-        maker.accept_offer(offer);
-        let finalize_deal = FinalizeDeal::from(&mut maker);
-        // send that over NOSTR
-        taker.finalize_deal(finalize_deal);
-
-        // checks
-        assert_eq!(maker.state, ContractState::Accepted);
-        assert_eq!(taker.state, ContractState::Accepted);
-        let maker_generated_maker_address = maker.get_address(Role::Maker);
-        let maker_generated_taker_address = maker.get_address(Role::Taker);
-        let taker_generated_maker_address = taker.get_address(Role::Maker);
-        let taker_generated_taker_address = taker.get_address(Role::Taker);
-        assert_eq!(
-            maker.maker_escrow.mine.public_key(),
-            taker.maker_escrow.their_pubkey.unwrap()
-        );
-        assert_eq!(
-            taker.maker_escrow.mine.public_key(),
-            maker.maker_escrow.their_pubkey.unwrap()
-        );
-        assert_eq!(
-            maker.calculate_escrow_pubkey(Role::Maker).0,
-            taker.calculate_escrow_pubkey(Role::Maker).0
-        );
-        assert_eq!(
-            maker.calculate_escrow_pubkey(Role::Taker).0,
-            taker.calculate_escrow_pubkey(Role::Taker).0
-        );
-        assert_eq!(
-            maker.maker_escrow.timelock.unwrap(),
-            taker.maker_escrow.timelock.unwrap()
-        );
-        assert_eq!(
-            maker.taker_escrow.timelock.unwrap(),
-            taker.taker_escrow.timelock.unwrap()
-        );
-        assert_eq!(maker_generated_maker_address, taker_generated_maker_address);
-        assert_eq!(maker_generated_taker_address, taker_generated_taker_address);
-        // end checks -- at this point we have both parties generating the same p2tr! woohoo!
-
-        assert_eq!(maker.get_spend_path(0), SpendPath::Unspendable);
-        assert_eq!(taker.get_spend_path(133), SpendPath::Unspendable);
-        assert_eq!(taker.get_spend_path(134), SpendPath::Timelock);
-        let preimage_reveal = maker.reveal_preimage().unwrap();
-        taker.accept_preimage(preimage_reveal);
-        assert_eq!(taker.get_spend_path(1), SpendPath::Hashlock);
-        assert_eq!(maker.get_spend_path(1), SpendPath::Hashlock);
-        let maker_key_reveal = maker.reveal_seckey().unwrap();
-        let taker_key_reveal = taker.reveal_seckey().unwrap();
-        maker.accept_seckey(taker_key_reveal);
-        assert_eq!(maker.get_spend_path(1), SpendPath::Keypath);
-        taker.accept_seckey(maker_key_reveal);
-        assert_eq!(taker.get_spend_path(1), SpendPath::Keypath);
-    }
-}
+mod tests {}
