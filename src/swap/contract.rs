@@ -63,10 +63,10 @@ pub enum SpendPath {
 
 #[derive(Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Contract {
-    pub escrow_keys: HashMap<Role, EscrowKeys>,
-    pub hashlock: Option<Hashlock>,
-    pub timelock: Timelock,
-    pub utxo: Option<Utxo>, // someday, this will be Option<Vec<Utxo>> and then we'll REALLY be dangerous
+    pub(crate) escrow_keys: HashMap<Role, EscrowKeys>,
+    pub(crate) hashlock: Option<Hashlock>,
+    pub(crate) timelock: Timelock,
+    pub(crate) utxo: Option<Utxo>, // someday, this will be Option<Vec<Utxo>> and then we'll REALLY be dangerous
 }
 
 impl Contract {
@@ -84,7 +84,7 @@ impl Contract {
         }
     }
 
-    pub fn create_hashlock(&mut self, hash: String, keys: EscrowKeys) {
+    pub(crate) fn create_hashlock(&mut self, hash: String, keys: EscrowKeys) {
         let hashlock = Hashlock {
             hash,
             preimage: None,
@@ -129,7 +129,7 @@ impl Contract {
     fn build_taproot_spend_info(&self) -> Result<TaprootSpendInfo> {
         let secp = Secp256k1::new();
         Ok(TaprootBuilder::new()
-            .add_leaf(1u8, self.hashlock.ok_or(ContractError::MissingHashlock)?.build_script())
+            .add_leaf(1u8, self.hashlock.as_ref().ok_or(ContractError::MissingHashlock)?.build_script())
             .map_err(|err| ContractError::TapTreeError(err))?
             .add_leaf(1u8, self.timelock.build_script())
             .map_err(|err| ContractError::TapTreeError(err))?
@@ -203,7 +203,7 @@ impl Contract {
                 vec![final_sig.serialize()]
             }
             SpendPath::Hashlock => {
-                let hashlock_script = self.hashlock.ok_or(ContractError::MissingHashlock)?.build_script();
+                let hashlock_script = self.hashlock.as_ref().ok_or(ContractError::MissingHashlock)?.build_script();
                 let control_block = self
                     .build_taproot_spend_info()?
                     .control_block(&(hashlock_script.clone(), LeafVersion::TapScript))
@@ -219,7 +219,7 @@ impl Contract {
                 let message = secp256k1::Message::from(sighash);
                 let keypair = KeyPair::from_secret_key(
                     &secp,
-                    &self.hashlock.ok_or(ContractError::MissingHashlock)?.seckey.ok_or(ContractError::NoPrivKeys)?,
+                    &self.hashlock.as_ref().ok_or(ContractError::MissingHashlock)?.seckey.ok_or(ContractError::NoPrivKeys)?,
                 );
                 let signature = secp.sign_schnorr(&message, &keypair);
                 let final_sig = schnorr::SchnorrSig {
@@ -230,6 +230,7 @@ impl Contract {
                     final_sig.serialize(),
                     Vec::from(
                         self.hashlock
+                            .as_ref()
                             .ok_or(ContractError::MissingHashlock)?
                             .preimage
                             .as_ref()

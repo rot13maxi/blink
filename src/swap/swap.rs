@@ -5,12 +5,8 @@ use bitcoin::{Address, Network, Transaction};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ops::Deref;
-use nostr_sdk::nostr::Contact;
-use crate::swap::components::EscrowKeys;
 use crate::swap::event::SwapEvent;
 use crate::swap::message::{Cancel, Offer, OfferResponse, Proposal, SwapMessage};
-use crate::swap::message::SwapMessage::OfferResponse;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub(crate) enum SwapInstruction {

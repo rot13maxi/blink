@@ -18,7 +18,7 @@ impl EscrowKeys {
         let secp = Secp256k1::new();
         let (seckey, pubkey) = secp.generate_keypair(&mut rand::thread_rng());
         Self {
-            pubkey: pubkey,
+            pubkey,
             seckey: Some(seckey),
         }
     }
