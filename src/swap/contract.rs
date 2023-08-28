@@ -296,6 +296,3 @@ impl From<(Offer, XOnlyPublicKey)> for Contract {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}

@@ -8,12 +8,10 @@ Alice and Bob are going to swap coins.
 5. Bob sends Alice the address that he is going to escrow coins into. Bob is in the `PendingLock` state 
 6. Alice checks Bob's address and if it matches what she computed, Alice sends over the address that she computed. Alice is in the `PendingLock` state.
 7. Bob checks Alice's address. If it matches what he computed, he deposits coins into his escrow address. Bob is now in the `Deposited` state.
-8. Alice sees Bob's deposit. She waits for it to be confirmed and then desposits coins in her escrow. Alice is now in the `Deposited` state
-9. Bob sees Alice's despoit. He waits for it to be confirmed. Once it is, he sends the hashlock preimage to Alice. Bob is now in the `PreimageRevealed` state.
-10. At this point, either participant can safely get the other escrow coins. Alice is also in the `PreimageRevealed` state.
-11. Once Alice gets the preimage, she sends her private key for her escrow to Bob. Alice is in the `SecKeyRevealed` state
-12. Once Bob gets the private key, he sends the private key for his escrow to Alice. Bob is in the `SecKeyRevealed` state
-13. Alice and Bob can now each spend the other escrow by the "happy path" and the swap is complete. They simply need to spend before the refund timelock expires. They are both in the `Closable` state until they spend, and then they will be in the `Closed` state.
+8. Alice sees Bob's deposit. She waits for it to be confirmed and then desposits coins in her escrow. Alice is now in the `Deposited` state 
+9. At this point, if Bob spends via the hashlock spend, Alice can observe the preimage and spend as well. So she sends her private key for her escrow to Bob. Alice is in the `SecKeyRevealed` state
+10. Once Bob gets the private key, he sends the private key for his escrow to Alice. Bob is in the `SecKeyRevealed` state 
+11. Alice and Bob can now each spend the other escrow by the "happy path" and the swap is complete. They simply need to spend before the refund timelock expires. They are both in the `Closable` state until they spend, and then they will be in the `Closed` state.
 
 If at any point after they've reached the `Deposited` state, the timelock on the refund-path of their escrow reaches maturation, they enter the `RefundSpend` state and try to get their money back.
 Once a participant reaches the `Deposited` state, they monitor the chain for the other participant spending their escrow using the hashlock path. If they see it, the enter the `HashlockSpend` state and spend the other escrow using the preimage.

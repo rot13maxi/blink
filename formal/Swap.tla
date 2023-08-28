@@ -107,20 +107,8 @@ ProposerDeposit == /\ proposer_state = "pendinglock"
                    /\ proposer_escrow' = "pending_deposit"
                    /\ UNCHANGED << partner_state, dm, partner_escrow, timelocks >>
 
-RevealPreimage == /\ partner_state = "deposited"
-                  /\ proposer_escrow = "confirmed_deposit"
-                  /\ partner_escrow = "confirmed_deposit"
-                  /\ TimelocksOk
-                  /\ dm' = "preimage"
-                  /\ partner_state' = "preimagerevealed"
-                  /\ UNCHANGED << proposer_state, escrows, timelocks >>
-                  
-ReceivePreimage == /\ dm = "preimage"
-                   /\ proposer_state \notin {"closable", "closed", "closedtimelock"}
-                   /\ proposer_state' = "preimagerevealed"
-                   /\ UNCHANGED << partner_state, escrows, dm, timelocks >>
 
-SendProposerSeckey ==  /\ proposer_state = "preimagerevealed"
+SendProposerSeckey ==  /\ proposer_state = "deposited"
                        /\ proposer_escrow = "confirmed_deposit"
                        /\ partner_escrow = "confirmed_deposit"
                        /\ TimelocksOk
@@ -150,8 +138,6 @@ ProtocolAction == \/ ProposeSwap
                   \/ ProposerConfirmAddress
                   \/ PartnerDeposit
                   \/ ProposerDeposit
-                  \/ RevealPreimage
-                  \/ ReceivePreimage
                   \/ SendProposerSeckey
                   \/ ReceiveProposerSecKey
                   \/ ReceivePartnerSecKey
@@ -203,8 +189,8 @@ ProposerObservesPreimageOnchain == /\ proposer_escrow = "confirmed_spend"
                                    /\ proposer_state' = "preimagerevealed"
                                    /\ UNCHANGED << partner_state, escrows, timelocks, dm >>
 
-\* Proposer can spend from the hashlock as soon as the preimage is revealed, either
-\* through the protocol or because they saw the Partner spend with it onchain.
+\* Proposer can spend from the hashlock as soon as the preimage is revealed
+\* because they saw the Partner spend with it onchain.
 \* The Proposer spends the partner escrow.
 ProposerSpendHashLock == /\ partner_escrow = "confirmed_deposit"
                          /\ TimelocksOk
